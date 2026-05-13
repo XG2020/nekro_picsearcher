@@ -121,6 +121,26 @@ class PicSearcherConfig(ConfigBase):
         title="允许抓取私网地址",
         description="默认禁止抓取 localhost、内网 IP 等私有地址，防止搜索结果链接触发内网访问",
     )
+    fetch_webpage_for_top: int = Field(
+        default=3,
+        title="仅对前 N 条抓取网页",
+        description="仅对前 N 条高可信结果抓取来源网页，后面结果只保留搜图信息与结构化结论，可大幅提升响应速度",
+    )
+    fast_mode: bool = Field(
+        default=False,
+        title="快速模式",
+        description="跳过所有来源网页抓取，仅进行搜图、实体提取与结构化结论，响应最快",
+    )
+    webpage_prefer_proxy: bool = Field(
+        default=True,
+        title="优先使用代理",
+        description="网页抓取优先使用代理（配置了 DEFAULT_PROXY 时）",
+    )
+    webpage_try_fallback: bool = Field(
+        default=True,
+        title="失败时自动切换代理策略重试",
+        description="网页抓取失败时自动切换代理策略再试一次（优先用代理→失败试不用代理，或反过来）",
+    )
 
 
 _WEBPAGE_CACHE: Dict[str, Tuple[float, Dict[str, str]]] = {}
@@ -369,7 +389,7 @@ def _classify_source_type(url: str, item: Dict[str, Any], page_text: str) -> Tup
     if any(token in domain for token in ecommerce_domains) or any(
         keyword in merged for keyword in ["price", "buy", "sale", "商品", "购买", "店铺", "加入购物车"]
     ):
-        return "电商商品页", "页面更像商品销售或店铺展示", -4.0
+        return "电商商品页", "页面更像商品销售或店铺展示，通常不是原始来源", -16.0
     if any(token in domain for token in discussion_domains) or any(
         keyword in merged for keyword in ["forum", "thread", "帖子", "评论", "问答", "discussion", "回复"]
     ):
@@ -387,6 +407,349 @@ def _classify_source_type(url: str, item: Dict[str, Any], page_text: str) -> Tup
     ):
         return "社交媒体页", "页面更像社交平台发布内容", 4.0
     return "未识别", "暂未命中明显来源类型特征", 0.0
+
+
+def _primary_item_label(item: Dict[str, Any], fallback: str = "") -> str:
+    return _clean_text(
+        item.get("title")
+        or item.get("source")
+        or item.get("site_name")
+        or item.get("author")
+        or fallback
+    )
+
+
+def _split_candidate_text(text: str) -> List[str]:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return []
+    candidates = [cleaned]
+    for sep in [" | ", " / ", " - ", " — ", "：", ":"]:
+        if sep in cleaned:
+            candidates.extend(part.strip() for part in cleaned.split(sep))
+    unique: List[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        normalized = value.strip("[](){}<>\"'` ")
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(normalized)
+    return unique
+
+
+def _is_meaningful_candidate(text: str) -> bool:
+    candidate = _clean_text(text).strip("[](){}<>\"'` ")
+    if not candidate:
+        return False
+    if len(candidate) < 2 or len(candidate) > 80:
+        return False
+    if _is_url(candidate):
+        return False
+    lower = candidate.lower()
+    blocked = {
+        "official",
+        "official site",
+        "official website",
+        "artist",
+        "author",
+        "source",
+        "image",
+        "images",
+        "result",
+        "results",
+        "similar image",
+        "similar images",
+        "untitled",
+        "unknown",
+        "pixiv",
+        "fanbox",
+        "artstation",
+        "deviantart",
+        "twitter",
+        "x",
+    }
+    if lower in blocked:
+        return False
+    if re.fullmatch(r"[\W_]+", candidate):
+        return False
+    if sum(ch.isalnum() for ch in candidate) < 2:
+        return False
+    return True
+
+
+def _extract_tag_values(item: Dict[str, Any], prefixes: List[str]) -> List[str]:
+    values: List[str] = []
+    for raw_tag in item.get("tags", []) or []:
+        tag = _clean_text(raw_tag)
+        lower_tag = tag.lower()
+        for prefix in prefixes:
+            prefix_lower = prefix.lower()
+            if lower_tag.startswith(prefix_lower):
+                payload = tag[len(prefix):].lstrip(" :：")
+                for part in _split_candidate_text(payload):
+                    if _is_meaningful_candidate(part):
+                        values.append(part)
+    return values
+
+
+def _dedupe_keep_order(values: List[str]) -> List[str]:
+    unique: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = _clean_text(value)
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(cleaned)
+    return unique
+
+
+def _entry_text_corpus(entry: Dict[str, Any]) -> str:
+    item = entry["item"]
+    return _clean_text(
+        " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("source") or ""),
+                str(item.get("site_name") or ""),
+                str(item.get("author") or ""),
+                str(entry.get("page_summary") or ""),
+                str(entry.get("url") or ""),
+            ]
+        )
+    ).lower()
+
+
+def _is_game_domain(domain: str) -> bool:
+    if not domain:
+        return False
+    game_domains = [
+        "steamcommunity.com",
+        "steampowered.com",
+        "fandom.com",
+        "gamewith.jp",
+        "gamewith.net",
+        "appmedia.jp",
+        "4gamer.net",
+        "famitsu.com",
+        "ign.com",
+        "gamespot.com",
+        "polygon.com",
+        "kotaku.com",
+        "rockpapershotgun.com",
+        "pcgamer.com",
+        "gamer.com.tw",
+        "vgtime.com",
+        "3dmgame.com",
+        "ali213.net",
+        "gamersky.com",
+        "bilibili.com",
+        "hoyolab.com",
+        "miyoushe.com",
+        "game8.jp",
+        "siliconera.com",
+        "destructoid.com",
+        "gameinformer.com",
+        "edge-online.com",
+        "playstation.com",
+        "xbox.com",
+        "nintendo.com",
+        "epicgames.com",
+        "gog.com",
+        "itch.io",
+        "nexusmods.com",
+        "reddit.com",
+        "twitter.com",
+        "x.com",
+    ]
+    return any(token in domain for token in game_domains)
+
+
+def _has_game_signals(entry: Dict[str, Any]) -> bool:
+    text = _entry_text_corpus(entry)
+    domain = _domain_of(entry.get("url", ""))
+    if _is_game_domain(domain):
+        return True
+    if not text:
+        return False
+    game_keywords = [
+        "game",
+        "gaming",
+        "gameplay",
+        "video game",
+        "visual novel",
+        "rpg",
+        "mmo",
+        "mmorpg",
+        "gacha",
+        "boss",
+        "npc",
+        "quest",
+        "mission",
+        "walkthrough",
+        "steam",
+        "playstation",
+        "xbox",
+        "nintendo",
+        "手游",
+        "端游",
+        "网游",
+        "单机",
+        "游戏",
+        "实机",
+        "过场",
+        "剧情",
+        "攻略",
+        "角色",
+        "立绘",
+        "皮肤",
+        "武器",
+        "boss",
+        "截图",
+    ]
+    screenshot_keywords = [
+        "screenshot",
+        "in-game",
+        "in game",
+        "cutscene",
+        "hud",
+        "ui",
+        "battle pass",
+        "quest",
+        "mission",
+        "游戏截图",
+        "实机截图",
+        "过场截图",
+        "战斗界面",
+        "角色界面",
+        "菜单界面",
+        "任务界面",
+    ]
+    return any(keyword in text for keyword in [*game_keywords, *screenshot_keywords])
+
+
+def _split_game_title_parts(text: str) -> Tuple[List[str], List[str]]:
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return [], []
+    separators = [" | ", " - ", " — ", " – ", " : ", "：", " / ", " × "]
+    character_candidates: List[str] = []
+    work_candidates: List[str] = []
+    for sep in separators:
+        if sep in cleaned:
+            parts = [p.strip() for p in cleaned.split(sep)]
+            if len(parts) >= 2:
+                for i in range(len(parts)):
+                    part = parts[i]
+                    if not _is_meaningful_candidate(part):
+                        continue
+                    if i == 0:
+                        character_candidates.append(part)
+                    else:
+                        work_candidates.append(part)
+    return _dedupe_keep_order(character_candidates), _dedupe_keep_order(work_candidates)
+
+
+def _collect_entry_entities(entry: Dict[str, Any]) -> Dict[str, List[str]]:
+    item = entry["item"]
+    engine = str(entry.get("engine") or "")
+    domain = _domain_of(entry["url"])
+    source_type = str(entry.get("source_type") or "")
+    has_game_signals = _has_game_signals(entry)
+    is_game_domain = _is_game_domain(domain)
+    entities: Dict[str, List[str]] = {
+        "characters": [],
+        "works": [],
+        "authors": [],
+        "sites": [],
+        "objects": [],
+    }
+
+    if domain:
+        entities["sites"].append(domain)
+    for site_value in [item.get("site_name"), item.get("source")]:
+        for candidate in _split_candidate_text(str(site_value or "")):
+            if _is_meaningful_candidate(candidate) and len(candidate) <= 40:
+                entities["sites"].append(candidate)
+
+    for candidate in _split_candidate_text(str(item.get("author") or "")):
+        if _is_meaningful_candidate(candidate):
+            entities["authors"].append(candidate)
+
+    if engine == "anime_trace":
+        for candidate in _split_candidate_text(str(item.get("title") or "")):
+            if _is_meaningful_candidate(candidate):
+                entities["characters"].append(candidate)
+        for candidate in _split_candidate_text(str(item.get("source") or "")):
+            if _is_meaningful_candidate(candidate):
+                entities["works"].append(candidate)
+    elif engine == "tracemoe":
+        for candidate in _split_candidate_text(str(item.get("title") or "")):
+            if _is_meaningful_candidate(candidate):
+                entities["works"].append(candidate)
+    else:
+        for candidate in _split_candidate_text(str(item.get("source") or "")):
+            if _is_meaningful_candidate(candidate):
+                entities["works"].append(candidate)
+
+    if has_game_signals or is_game_domain:
+        title_text = str(item.get("title") or "")
+        chars_from_split, works_from_split = _split_game_title_parts(title_text)
+        entities["characters"].extend(chars_from_split)
+        entities["works"].extend(works_from_split)
+        for candidate in _split_candidate_text(title_text):
+            if _is_meaningful_candidate(candidate):
+                entities["characters"].append(candidate)
+                entities["works"].append(candidate)
+
+    if item.get("title") and source_type in {"电商商品页", "官方/权威页", "聚合转载页", "资讯/资料页"}:
+        for candidate in _split_candidate_text(str(item.get("title") or "")):
+            if _is_meaningful_candidate(candidate):
+                entities["objects"].append(candidate)
+
+    entities["authors"].extend(_extract_tag_values(item, ["artist:", "creator:", "author:", "group:", "circle:"]))
+    entities["characters"].extend(_extract_tag_values(item, ["character:"]))
+    entities["works"].extend(_extract_tag_values(item, ["parody:", "series:", "copyright:"]))
+
+    return {
+        key: _dedupe_keep_order(values)
+        for key, values in entities.items()
+    }
+
+
+def _infer_image_kind(entry: Dict[str, Any]) -> Tuple[str, float]:
+    engine = str(entry.get("engine") or "")
+    source_type = str(entry.get("source_type") or "")
+    domain = _domain_of(entry["url"])
+    text = _entry_text_corpus(entry)
+    if engine == "tracemoe":
+        return "动画截图", 16.0
+    if engine == "anime_trace":
+        return "二次元角色图", 16.0
+    if any(keyword in text for keyword in ["screenshot", "in-game", "in game", "cutscene", "hud", "ui", "游戏截图", "实机截图", "过场截图", "战斗界面", "角色界面", "任务界面"]):
+        return "游戏截图", 16.0
+    if _has_game_signals(entry):
+        return "游戏角色图或游戏宣传图", 14.0
+    if source_type == "电商商品页":
+        return "商品或周边图", 14.0
+    if source_type == "官方/权威页":
+        return "官方宣传图或资料图", 12.0
+    if source_type == "原始发布页":
+        if any(token in domain for token in ["pixiv.net", "artstation.com", "deviantart.com", "fanbox.cc", "skeb.jp"]):
+            return "插画或创作图", 14.0
+        return "原始发布内容", 10.0
+    if source_type == "社交媒体页":
+        return "社交媒体发布图", 8.0
+    if source_type == "聚合转载页":
+        return "转载或索引图", 6.0
+    return "未识别", 0.0
 
 
 def _score_result(engine: str, item: Dict[str, Any]) -> Tuple[float, List[str], Dict[str, float]]:
@@ -448,12 +811,18 @@ def _score_detail_text(score_detail: Dict[str, float]) -> str:
         ("url", "链接"),
         ("webpage", "网页内容"),
         ("consensus", "跨结果共识"),
+        ("identity_bonus", "身份识别增强"),
+        ("source_bonus", "出处识别增强"),
     ]
     parts = [
         f"{label} {score_detail[key]:.1f}"
         for key, label in ordered_keys
         if score_detail.get(key)
     ]
+    if score_detail.get("identity_total") is not None:
+        parts.append(f"身份分 {score_detail['identity_total']:.1f}")
+    if score_detail.get("source_total") is not None:
+        parts.append(f"出处分 {score_detail['source_total']:.1f}")
     total = score_detail.get("total", 0.0)
     parts.append(f"总分 {total:.1f}")
     return "；".join(parts)
@@ -505,11 +874,21 @@ def _extract_html_text(raw_html: str) -> str:
         return _clean_text(text)
 
 
-async def _fetch_webpage_text(url: str, cfg: PicSearcherConfig) -> str:
+async def _try_fetch_once(url: str, use_proxy: bool, cfg: PicSearcherConfig) -> str:
     _validate_fetch_url(url, cfg)
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
     }
     proxies = _get_proxy()
     client_kwargs: Dict[str, Any] = {
@@ -517,12 +896,12 @@ async def _fetch_webpage_text(url: str, cfg: PicSearcherConfig) -> str:
         "follow_redirects": True,
         "headers": headers,
     }
-    if proxies:
+    if use_proxy and proxies:
         client_kwargs["proxy"] = proxies
     try:
         client = httpx.AsyncClient(**client_kwargs)
     except TypeError:
-        if proxies:
+        if use_proxy and proxies:
             client_kwargs.pop("proxy", None)
             client_kwargs["proxies"] = proxies
         client = httpx.AsyncClient(**client_kwargs)
@@ -545,6 +924,27 @@ async def _fetch_webpage_text(url: str, cfg: PicSearcherConfig) -> str:
             encoding = response.encoding or "utf-8"
             raw_text = b"".join(chunks).decode(encoding, errors="ignore")
             return _extract_html_text(raw_text)
+
+
+async def _fetch_webpage_text(url: str, cfg: PicSearcherConfig) -> str:
+    proxies = _get_proxy()
+    prefer_proxy = bool(cfg.webpage_prefer_proxy) and bool(proxies)
+    try_fallback = bool(cfg.webpage_try_fallback) and bool(proxies)
+
+    first_use_proxy = prefer_proxy
+    first_exc = None
+
+    try:
+        return await _try_fetch_once(url, first_use_proxy, cfg)
+    except Exception as ex:
+        first_exc = ex
+        if not try_fallback:
+            raise
+
+    try:
+        return await _try_fetch_once(url, not first_use_proxy, cfg)
+    except Exception as second_exc:
+        raise first_exc or second_exc
 
 
 async def _enrich_ranked_result(entry: Dict[str, Any], cfg: PicSearcherConfig) -> Dict[str, Any]:
@@ -606,14 +1006,44 @@ async def _enrich_ranked_result(entry: Dict[str, Any], cfg: PicSearcherConfig) -
         }
 
 
-async def _enrich_trusted_results(search_results: List[Dict[str, Any]], cfg: PicSearcherConfig) -> List[Dict[str, Any]]:
+async def _enrich_trusted_results(
+    search_results: List[Dict[str, Any]],
+    cfg: PicSearcherConfig,
+    fetch_webpage_for_top: Optional[int] = None,
+    fast_mode: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
+    use_fast_mode = fast_mode if fast_mode is not None else bool(cfg.fast_mode)
+    use_fetch_top = fetch_webpage_for_top if fetch_webpage_for_top is not None else int(cfg.fetch_webpage_for_top)
+    use_fetch_top = max(0, use_fetch_top)
+
     ranked = _flatten_ranked_results(search_results, cfg.trusted_results)
     if not ranked:
         return []
-    enriched = await asyncio.gather(*[_enrich_ranked_result(entry, cfg) for entry in ranked])
+
+    if use_fast_mode:
+        use_fetch_top = 0
+
+    enriched_full: List[Optional[Dict[str, Any]]] = []
+    if use_fetch_top > 0:
+        enriched_top = await asyncio.gather(*[_enrich_ranked_result(entry, cfg) for entry in ranked[:use_fetch_top]])
+        enriched_full.extend(enriched_top)
+
+    for entry in ranked[use_fetch_top:]:
+        enriched_full.append(
+            {
+                **entry,
+                "page_summary": "",
+                "page_error": "skipped for performance",
+                "cache_hit": "false",
+                "source_type": "未识别",
+                "source_type_reason": "未抓取网页",
+                "source_type_weight": 0.0,
+            }
+        )
+
     domain_count: Dict[str, int] = {}
     title_count: Dict[str, int] = {}
-    for entry in enriched:
+    for entry in enriched_full:
         domain = _domain_of(entry["url"])
         if domain:
             domain_count[domain] = domain_count.get(domain, 0) + 1
@@ -627,12 +1057,14 @@ async def _enrich_trusted_results(search_results: List[Dict[str, Any]], cfg: Pic
         if title:
             title_count[title] = title_count.get(title, 0) + 1
     finalized: List[Dict[str, Any]] = []
-    for entry in enriched:
+    for entry in enriched_full:
         score_detail = dict(entry.get("score_detail") or {})
         score_detail["source_type"] = float(entry.get("source_type_weight") or 0.0)
         webpage_bonus = 0.0
-        if entry.get("page_summary"):
-            webpage_bonus = 12.0 if not entry.get("page_error") else 6.0
+        if entry.get("page_summary") and entry.get("page_error") not in {"skipped for performance", "empty"}:
+            webpage_bonus = 12.0
+        elif entry.get("page_summary"):
+            webpage_bonus = 6.0
         score_detail["webpage"] = webpage_bonus
         consensus_bonus = 0.0
         domain = _domain_of(entry["url"])
@@ -648,9 +1080,61 @@ async def _enrich_trusted_results(search_results: List[Dict[str, Any]], cfg: Pic
         if title_count.get(title, 0) > 1:
             consensus_bonus += 6.0
         score_detail["consensus"] = consensus_bonus
-        total = sum(value for key, value in score_detail.items() if key != "total")
-        score_detail["total"] = total
-        finalized.append({**entry, "score": total, "score_detail": score_detail})
+        base_total = sum(value for key, value in score_detail.items() if key not in {"total", "identity_total", "source_total", "identity_bonus", "source_bonus"})
+        entities = _collect_entry_entities(entry)
+        identity_bonus = 0.0
+        source_bonus = 0.0
+        domain = _domain_of(entry["url"])
+        is_game_domain = _is_game_domain(domain)
+        if entities["characters"]:
+            identity_bonus += 16.0
+        if entities["works"]:
+            identity_bonus += 12.0
+        if _has_game_signals(entry):
+            identity_bonus += 10.0
+        if is_game_domain:
+            identity_bonus += 14.0
+            source_bonus += 12.0
+        if entities["authors"]:
+            identity_bonus += 6.0
+            source_bonus += 10.0
+        if entities["objects"]:
+            identity_bonus += 8.0
+        if entry.get("engine") in {"anime_trace", "tracemoe"}:
+            identity_bonus += 10.0
+        if entry.get("source_type") in {"原始发布页", "官方/权威页"}:
+            source_bonus += 16.0
+        elif entry.get("source_type") == "社交媒体页":
+            source_bonus += 6.0
+        elif entry.get("source_type") == "聚合转载页":
+            source_bonus -= 6.0
+        elif entry.get("source_type") == "电商商品页":
+            source_bonus -= 12.0
+        if entry["item"].get("author_url"):
+            source_bonus += 6.0
+        path = urlparse(entry["url"]).path.lower()
+        if re.search(r"/(artworks|illust|status|posts?|gallery|works?)/[\w-]+", path):
+            source_bonus += 6.0
+        if re.search(r"/\d{4,}", path):
+            source_bonus += 4.0
+        score_detail["identity_bonus"] = identity_bonus
+        score_detail["source_bonus"] = source_bonus
+        identity_total = base_total + identity_bonus
+        source_total = base_total + source_bonus
+        overall_total = identity_total * 0.6 + source_total * 0.4
+        score_detail["identity_total"] = identity_total
+        score_detail["source_total"] = source_total
+        score_detail["total"] = overall_total
+        finalized.append(
+            {
+                **entry,
+                "score": overall_total,
+                "identity_score": identity_total,
+                "source_score": source_total,
+                "entities": entities,
+                "score_detail": score_detail,
+            }
+        )
     finalized.sort(key=lambda entry: entry["score"], reverse=True)
     return finalized
 
@@ -659,30 +1143,22 @@ def _build_final_assessment(trusted: List[Dict[str, Any]]) -> List[str]:
     if not trusted:
         return ["暂无可形成结论的可信来源。"]
     best = trusted[0]
-    best_item = best["item"]
-    best_title = _clean_text(
-        best_item.get("title")
-        or best_item.get("source")
-        or best_item.get("site_name")
-        or best_item.get("author")
-        or best["url"]
-    )
+    best_identity = max(trusted, key=lambda entry: float(entry.get("identity_score") or entry["score"]))
+    best_source = max(trusted, key=lambda entry: float(entry.get("source_score") or entry["score"]))
+    best_title = _primary_item_label(best["item"], best["url"])
+    best_identity_title = _primary_item_label(best_identity["item"], best_identity["url"])
+    best_source_title = _primary_item_label(best_source["item"], best_source["url"])
     lines = [
-        f"最优候选：{best_title}",
-        f"最优候选链接：{best['url']}",
-        f"最优候选来源类型：{best.get('source_type', '未识别')}（{best.get('source_type_reason', '无')}）",
-        f"最优候选得分：{best['score']:.1f}（{_score_detail_text(best.get('score_detail') or {})}）",
+        f"综合最优候选：{best_title}",
+        f"综合最优链接：{best['url']}",
+        f"身份识别最佳候选：{best_identity_title}（身份分 {float(best_identity.get('identity_score') or best_identity['score']):.1f}）",
+        f"出处识别最佳候选：{best_source_title}（出处分 {float(best_source.get('source_score') or best_source['score']):.1f}）",
+        f"综合最优来源类型：{best.get('source_type', '未识别')}（{best.get('source_type_reason', '无')}）",
+        f"综合最优得分：{best['score']:.1f}（{_score_detail_text(best.get('score_detail') or {})}）",
     ]
     if len(trusted) > 1:
         second = trusted[1]
-        second_item = second["item"]
-        second_title = _clean_text(
-            second_item.get("title")
-            or second_item.get("source")
-            or second_item.get("site_name")
-            or second_item.get("author")
-            or second["url"]
-        )
+        second_title = _primary_item_label(second["item"], second["url"])
         delta = best["score"] - second["score"]
         if delta >= 15:
             lines.append(f"结论倾向：首选结果明显领先，较次选高 {delta:.1f} 分。")
@@ -701,6 +1177,85 @@ def _build_final_assessment(trusted: List[Dict[str, Any]]) -> List[str]:
             lines.append("建议表述：可优先把首选来源当作主依据；若与视觉观察冲突，明确说明冲突点并保留不确定性。")
         else:
             lines.append("建议表述：首选来源可作重要参考，但仍建议与其他来源或视觉线索交叉验证。")
+    return lines
+
+
+def _add_weighted_candidate(
+    bucket: Dict[str, Dict[str, Any]],
+    text: str,
+    weight: float,
+    evidence: str,
+) -> None:
+    candidate = _clean_text(text)
+    if not _is_meaningful_candidate(candidate):
+        return
+    key = candidate.lower()
+    if key not in bucket:
+        bucket[key] = {"text": candidate, "score": 0.0, "evidence": []}
+    bucket[key]["score"] += weight
+    if evidence and evidence not in bucket[key]["evidence"]:
+        bucket[key]["evidence"].append(evidence)
+
+
+def _top_bucket_text(bucket: Dict[str, Dict[str, Any]], limit: int, fallback: str) -> str:
+    if not bucket:
+        return fallback
+    ordered = sorted(bucket.values(), key=lambda item: item["score"], reverse=True)
+    return "；".join(item["text"] for item in ordered[:limit])
+
+
+def _build_structured_summary(trusted: List[Dict[str, Any]]) -> List[str]:
+    if not trusted:
+        return ["暂无可供结构化提取的可信候选。"]
+    identity_ranked = sorted(trusted, key=lambda entry: float(entry.get("identity_score") or entry["score"]), reverse=True)
+    source_ranked = sorted(trusted, key=lambda entry: float(entry.get("source_score") or entry["score"]), reverse=True)
+    best_identity = identity_ranked[0]
+    best_source = source_ranked[0]
+    kind_bucket: Dict[str, Dict[str, Any]] = {}
+    character_bucket: Dict[str, Dict[str, Any]] = {}
+    work_bucket: Dict[str, Dict[str, Any]] = {}
+    author_bucket: Dict[str, Dict[str, Any]] = {}
+    object_bucket: Dict[str, Dict[str, Any]] = {}
+    site_bucket: Dict[str, Dict[str, Any]] = {}
+    for entry in trusted[: max(3, min(6, len(trusted)))]:
+        identity_weight = max(1.0, float(entry.get("identity_score") or entry["score"]))
+        source_weight = max(1.0, float(entry.get("source_score") or entry["score"]))
+        title = _primary_item_label(entry["item"], entry["url"])
+        entities = entry.get("entities") or _collect_entry_entities(entry)
+        for value in entities.get("characters", []):
+            _add_weighted_candidate(character_bucket, value, identity_weight, title)
+        for value in entities.get("works", []):
+            _add_weighted_candidate(work_bucket, value, identity_weight, title)
+        for value in entities.get("authors", []):
+            _add_weighted_candidate(author_bucket, value, source_weight, title)
+        for value in entities.get("objects", []):
+            _add_weighted_candidate(object_bucket, value, identity_weight, title)
+        for value in entities.get("sites", []):
+            _add_weighted_candidate(site_bucket, value, source_weight, title)
+        image_kind, kind_weight = _infer_image_kind(entry)
+        if image_kind != "未识别":
+            _add_weighted_candidate(kind_bucket, image_kind, kind_weight + identity_weight * 0.2, title)
+
+    identity_delta = float(best_identity.get("identity_score") or best_identity["score"]) - float(identity_ranked[1].get("identity_score") or identity_ranked[1]["score"]) if len(identity_ranked) > 1 else 999.0
+    source_delta = float(best_source.get("source_score") or best_source["score"]) - float(source_ranked[1].get("source_score") or source_ranked[1]["score"]) if len(source_ranked) > 1 else 999.0
+    if identity_delta >= 15 and source_delta >= 15:
+        uncertainty = "身份和出处候选都比较集中，可优先采用首选结论。"
+    elif identity_delta >= 10 or source_delta >= 10:
+        uncertainty = "已有较强候选，但仍建议核对角色名、作品名或作者名是否一致。"
+    else:
+        uncertainty = "前几名结果接近，请保留不确定性，避免把单一候选当作最终事实。"
+
+    best_source_label = _primary_item_label(best_source["item"], best_source["url"])
+    lines = [
+        f"图片类型：{_top_bucket_text(kind_bucket, 2, '暂未明确')}",
+        f"人物/角色候选：{_top_bucket_text(character_bucket, 3, '暂无明确人物或角色名，可结合作品候选继续判断')}",
+        f"作品/出处/游戏候选：{_top_bucket_text(work_bucket, 3, '暂无稳定作品名、出处名或游戏名')}",
+        f"作者/画师候选：{_top_bucket_text(author_bucket, 3, '暂无明确作者或画师名')}",
+        f"图片内容候选：{_top_bucket_text(object_bucket, 3, '暂无可直接归纳的物体/主题名称')}",
+        f"最可能原始来源：{best_source_label} -> {best_source['url']}",
+        f"可找到的网站：{_top_bucket_text(site_bucket, 6, _domain_of(best_source['url']) or '暂无明确站点')}",
+        f"判断提示：{uncertainty}",
+    ]
     return lines
 
 
@@ -887,9 +1442,17 @@ def _fmt_tineye(item: Any) -> Dict[str, Any]:
 @plugin.mount_prompt_inject_method("picsearcher_image_source_analysis")
 async def picsearcher_prompt_inject(_ctx: AgentCtx) -> str:
     return (
-        "当用户让你识别、判断、考据图片来源或解释图片内容时，不要只依赖视觉模态。"
-        "如果需要确认作品名、作者、出处、角色、事件、原始上下文或图片是否被误传，优先调用 `render_multi_engine_search` 进行反向搜图。"
-        "该方法会返回多引擎结果、可信度排序，并对高可信来源网页进行总结或正文清洗；多个结果不一致时，应优先比较可信度高、相似度高、来源字段完整且网页内容可验证的结果，再说明你的判断依据和不确定性。"
+        "【核心规则】识别图片时必须优先调用搜图工具：\n"
+        "1. 只要用户让你识别图片、解释图片内容、确认图片里的人物是谁、来自哪里、出自什么作品、作者/画师是谁、哪些网站能找到这张图，或要求考据图片来源、判断是否被搬运/误传时，**必须先调用 `render_multi_engine_search` 进行反向搜图，绝不能只用视觉模态回答**。\n"
+        "2. 即使你认为自己“看出来了”，也要调用搜图工具交叉验证，避免幻觉，优先以搜图的结构化结论为依据。\n"
+        "3. 回答时优先使用搜图结果里的「人物/角色候选」「作品/出处/游戏候选」「作者/画师候选」「最可能原始来源」这些结构化字段，不要自己编造。\n"
+        "4. 如果多个搜图结果不一致，要优先看身份分、出处分更高的结果，并且明确说明不确定性。\n"
+        "【工具说明】\n"
+        "- `render_multi_engine_search` 会在多个图片搜索引擎上同时反向搜图，自动筛选高可信结果，对部分来源网页抓取正文，最终返回结构化识别结论。\n"
+        "- 可选参数（按需使用）：\n"
+        "  - `fast_mode=True`：跳过网页抓取，响应最快，适合只需要快速知道角色名/游戏名/作品名的场景；\n"
+        "  - `fetch_webpage_for_top=N`：只对前 N 条抓网页，后面保留搜图信息以平衡速度与信息量；\n"
+        "  - 一般默认不用传额外参数，直接 `render_multi_engine_search(image=...)` 即可。"
     )
 
 
@@ -1061,7 +1624,7 @@ async def _do_search_single_safe(
 @plugin.mount_sandbox_method(
     method_type=SandboxMethodType.AGENT,
     name="render_multi_engine_search",
-    description="反向搜索图片来源，筛选可信结果并抓取来源网页正文，供 AI 结合来源信息分析图片。",
+    description="【优先调用】识别图片时必须先调用此工具！反向搜索图片来源，筛选可信结果并抓取来源网页正文，提供结构化识别结论：人物/角色候选、作品/出处/游戏候选、作者/画师候选、图片类型、最可能原始来源、可找到的网站。",
 )
 async def render_multi_engine_search(
     _ctx: AgentCtx,
@@ -1085,6 +1648,8 @@ async def render_multi_engine_search(
             - anime_trace: {"model": "anime", "is_multi": 1, "ai_detect": 1, "base64": "..."}
             - ehentai: {"covers": false, "similar": true, "exp": false}
             - tineye: {"show_unavailable_domains": false, "domain": "", "sort": "score", "order": "desc", "tags": ""}
+        fast_mode (bool | None): 是否开启快速模式，跳过所有来源网页抓取，仅返回搜图、实体提取与结构化结论
+        fetch_webpage_for_top (int | None): 仅对前 N 条高可信结果抓取来源网页，后面结果保留搜图信息以提升速度
 
     Returns:
         str: 多引擎聚合结果、可信度排序和高可信来源网页正文。
@@ -1096,10 +1661,22 @@ async def render_multi_engine_search(
             top_k=2,
             options={"bovw": true}
         )
+        # 快速模式（最快，只不抓网页）
+        /exec render_multi_engine_search(
+            image="https://example.com/image.jpg",
+            fast_mode=True
+        )
+        # 只对前 2 条抓网页，后面跳过
+        /exec render_multi_engine_search(
+            image="https://example.com/image.jpg",
+            fetch_webpage_for_top=2
+        )
     """
     image: Optional[str] = kwargs.pop("image", None) or (args[0] if len(args) > 0 else None)
     top_k: Optional[int] = kwargs.pop("top_k", None)
     options: Optional[Dict[str, Any]] = kwargs.pop("options", None)
+    fast_mode: Optional[bool] = kwargs.pop("fast_mode", None)
+    fetch_webpage_for_top: Optional[int] = kwargs.pop("fetch_webpage_for_top", None)
     if not image:
         raise ValueError("缺少参数 image")
     cfg = _get_cfg()
@@ -1132,9 +1709,21 @@ async def render_multi_engine_search(
     if any(e in {"ascii2d", "yandex", "google", "iqdb", "baidu", "google_lens", "ehentai", "exhentai"} for e in engs):
         _ensure_pyquery()
     search_results: List[Dict[str, Any]] = []
+    raw_result_lines: list[str] = []
+    engine_errors: list[str] = []
+    use_fast_mode = fast_mode if fast_mode is not None else bool(cfg.fast_mode)
+    use_fetch_top = fetch_webpage_for_top if fetch_webpage_for_top is not None else int(cfg.fetch_webpage_for_top)
+    use_fetch_top = max(0, use_fetch_top)
+    if use_fast_mode:
+        use_fetch_top = 0
+    mode_info = []
+    if use_fast_mode:
+        mode_info.append("快速模式：已跳过所有来源网页抓取，仅返回搜图、实体提取与结构化结论，响应最快")
+    else:
+        mode_info.append(f"常规模式：仅对前 {use_fetch_top} 条高可信结果抓取来源网页，后面结果保留搜图信息以提升速度")
     lines: list[str] = [
         f"Image: {image}",
-        "使用建议：不要只依赖视觉模态判断图片含义；请优先结合下方反向搜索来源、可信度排序和网页正文，交叉验证作品名、作者、出处、时间与上下文。",
+        "效率说明：" + "；".join(mode_info),
     ]
     search_tasks = [
         _do_search_single_safe(e, cfg, k, file_arg, proxy, options)
@@ -1147,7 +1736,7 @@ async def render_multi_engine_search(
             res = outcome["result"]
             search_results.append(res)
             items = res.get("items", [])
-            lines.append(f"\n[{res.get('engine','')}] {res.get('url','')}".strip())
+            raw_result_lines.append(f"\n[{res.get('engine','')}] {res.get('url','')}".strip())
             idx = 1
             for it in items:
                 parts: list[str] = []
@@ -1165,20 +1754,27 @@ async def render_multi_engine_search(
                     parts.append(src)
                 url = it.get("url") or it.get("video") or it.get("image") or ""
                 line = f"{idx}. " + " | ".join([p for p in parts if p]) + (f" -> {url}" if url else "")
-                lines.append(line)
+                raw_result_lines.append(line)
                 idx += 1
         else:
-            lines.append(f"\n[{e}] error: {outcome['error']}")
-    trusted = await _enrich_trusted_results(search_results, cfg)
+            engine_errors.append(f"[{e}] error: {outcome['error']}")
+    trusted = await _enrich_trusted_results(search_results, cfg, fetch_webpage_for_top=use_fetch_top, fast_mode=use_fast_mode)
     if trusted:
         consensus_hints = _detect_result_consensus(trusted)
+        structured_summary = _build_structured_summary(trusted)
         final_assessment = _build_final_assessment(trusted)
+        lines.append("\n[结构化识别结论]")
+        for structured_line in structured_summary:
+            lines.append(structured_line)
         lines.append("\n[最终研判摘要]")
         for assessment_line in final_assessment:
             lines.append(assessment_line)
-        lines.append("\n[可信结果筛选与网页内容]")
-        lines.append("说明：可信度基于引擎权重、相似度、标题/来源字段和可访问 URL 综合排序；多个结果不一致时，请优先比较此列表并给出不确定性判断。")
+        lines.append("\n[筛选后结果]")
+        lines.append("说明：综合排序同时考虑身份识别和出处识别；身份分更关注人物/作品/物体识别，出处分更关注原始来源、作者与可信发布页。")
+        lines.append(f"搜索概况：已启用 {len(engs)} 个引擎，成功返回 {len(search_results)} 个引擎结果，筛出 {len(trusted)} 条可信候选。")
         lines.append("共识/冲突提示：" + "；".join(consensus_hints))
+        if engine_errors:
+            lines.append("引擎异常：" + "；".join(engine_errors))
         for idx, entry in enumerate(trusted, 1):
             item = entry["item"]
             title = _clean_text(item.get("title") or item.get("source") or item.get("site_name") or item.get("author") or "")
@@ -1190,6 +1786,14 @@ async def render_multi_engine_search(
                 f"来源类型：{entry.get('source_type', '未识别')} | 判断依据："
                 f"{entry.get('source_type_reason', '无明显特征')}"
             )
+            if entry.get("entities"):
+                entities = entry["entities"]
+                if entities.get("characters"):
+                    lines.append(f"人物线索：{'；'.join(entities['characters'][:3])}")
+                if entities.get("works"):
+                    lines.append(f"作品线索：{'；'.join(entities['works'][:3])}")
+                if entities.get("authors"):
+                    lines.append(f"作者线索：{'；'.join(entities['authors'][:3])}")
             lines.append(f"可信依据：{'；'.join(entry['reasons'])}")
             lines.append(f"评分明细：{_score_detail_text(entry.get('score_detail') or {})}")
             if entry.get("page_summary"):
@@ -1199,5 +1803,11 @@ async def render_multi_engine_search(
             elif entry.get("page_error"):
                 lines.append(f"网页内容获取失败：{entry['page_error']}")
     else:
-        lines.append("\n[可信结果筛选与网页内容]\n未找到可访问 URL 的可信结果，请基于各引擎原始返回谨慎判断。")
+        lines.append("\n[筛选后结果]")
+        lines.append("未找到可访问 URL 的可信结果，以下回退展示各引擎原始返回，供你继续人工判断。")
+        if raw_result_lines:
+            lines.extend(raw_result_lines)
+        if engine_errors:
+            lines.append("\n[引擎异常]")
+            lines.extend(engine_errors)
     return "\n".join(lines)
