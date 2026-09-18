@@ -14,14 +14,22 @@
 
 ## 使用方式
 
-在聊天频道中使用 /exec（无需传入 _ctx）：
+插件提供 `reverse_search`（推荐）和兼容的 `render_multi_engine_search` 两个入口。使用 `/exec` 时无需传入 `_ctx`；如果当前消息或最近一条用户消息带有图片，也可以省略 `image`：
 
 ```
-/exec render_multi_engine_search(
+/exec reverse_search(
     image="https://example.com/image.jpg",
     top_k=3,
     options={"bovw": true}
 )
+```
+
+按意图选择引擎，或直接指定引擎：
+
+```text
+/exec render_multi_engine_search(intent="找角色")
+/exec render_multi_engine_search(intent="找出处和画师")
+/exec render_multi_engine_search(engine="saucenao", image="https://example.com/image.jpg")
 ```
 
 快速模式（跳过所有网页抓取，响应最快，仅返回搜图、实体提取与结构化结论）：
@@ -64,16 +72,23 @@
 - ascii2d_bovw
 - max_results
 - saucenao_api_key
+- yandex_cookies
+- google_serpapi_key
+- google_zenserp_key
+- google_search_country
+- google_search_language
+- allow_third_party_image_host
 - exhentai_cookie_member_id
 - exhentai_cookie_pass_hash
 - exhentai_cookie_igneous
 - webpage_fetch_timeout
 - webpage_content_chars
 - webpage_max_bytes
-- webpage_cache_ttl
 - allow_private_webpage_fetch
 - fetch_webpage_for_top：仅对前 N 条高可信结果抓取来源网页，后面结果只保留搜图信息，可大幅提升响应速度
 - fast_mode：快速模式，跳过所有来源网页抓取，仅进行搜图、实体提取与结构化结论，响应最快
+- search_timeout：单个搜索引擎请求超时时间，避免单个失效引擎拖慢整体响应
+- webpage_cache_ttl：来源网页缓存时间，减少同一图片重复调用时的网页抓取
 - webpage_prefer_proxy：网页抓取优先使用代理（配置了 DEFAULT_PROXY 时）
 - webpage_try_fallback：失败时自动切换代理策略重试（优先用代理→失败试不用代理，或反过来）
 
@@ -103,7 +118,10 @@
 - 部分引擎依赖 pyquery/lxml/cssselect，缺失时会提示安装
 - Lenso 引擎在主仓标注为受 Cloudflare 影响，可能不可用
 - ExHentai 需要有效的登录 Cookie（ipb_member_id、ipb_pass_hash，可选 igneous）
+- AnimeTrace 的角色/作品识别结果即使没有网页 URL 也会保留在候选证据中
+- 参考实现的 Yandex/Google Lens 本地图搜会上传到临时图床，可通过 `allow_third_party_image_host` 关闭
 - 默认只返回筛选后的可信结果，仅在无筛选结果时回退展示各引擎原始返回
 - 候选线索汇总属于文本片段聚合，可能混入站点名、转载页标题或商品页文案，最终结论应结合网页正文、页面证据和原图细节综合判断
 - 商品页面、聚合转载页面在出处识别中会被压低权重，优先返回原始发布平台与官方来源
 - 网页抓取支持自动代理策略切换：优先用代理→失败后（若启用）试不用代理，或反过来
+- AnimeTrace、SauceNAO、Yandex、Google Lens、E-Hentai 已切换到参考插件的统一请求/解析模块，支持共享代理、超时、Cookie 与 Google Lens 主备引擎

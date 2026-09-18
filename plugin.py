@@ -3,7 +3,9 @@ import html
 import ipaddress
 import re
 import socket
+import time
 import unicodedata
+from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -28,6 +30,7 @@ from .PicImageSearch.engines.google_lens import GoogleLens
 from .PicImageSearch.engines.lenso import Lenso
 from .PicImageSearch.engines.copyseeker import Copyseeker
 from .PicImageSearch.engines.ehentai import EHentai
+from .ReverseSearcher.model import BaseSearchModel
 
 
 plugin = NekroPlugin(
@@ -35,7 +38,7 @@ plugin = NekroPlugin(
     module_name="nekro_picsearcher",
     description="基于 PicImageSearch 的多引擎图片反向搜索工具",
     author="XGGM",
-    version="1.2.0",
+    version="1.3.0",
     url="https://github.com/XG2020/nekro_picsearcher",
 )
 
@@ -76,13 +79,13 @@ class PicSearcherConfig(ConfigBase):
     enable_google: bool = Field(default=False, title="启用 Google")
     enable_bing: bool = Field(default=False, title="启用 Bing")
     enable_ascii2d: bool = Field(default=False, title="启用 Ascii2D")
-    enable_anime_trace: bool = Field(default=False, title="启用 AnimeTrace")
+    enable_anime_trace: bool = Field(default=True, title="启用 AnimeTrace")
     enable_tracemoe: bool = Field(default=False, title="启用 TraceMoe")
     enable_iqdb: bool = Field(default=False, title="启用 IQDB")
     enable_google_lens: bool = Field(default=False, title="启用 Google Lens")
     enable_lenso: bool = Field(default=False, title="启用 Lenso")
     enable_copyseeker: bool = Field(default=False, title="启用 Copyseeker")
-    enable_saucenao: bool = Field(default=False, title="启用 SauceNAO")
+    enable_saucenao: bool = Field(default=True, title="启用 SauceNAO")
     enable_tineye: bool = Field(default=False, title="启用 Tineye")
     enable_ehentai: bool = Field(default=False, title="启用 EHentai")
     enable_exhentai: bool = Field(default=False, title="启用 ExHentai")
@@ -110,6 +113,41 @@ class PicSearcherConfig(ConfigBase):
         default=1048576,
         title="网页抓取最大字节数",
         description="限制单个来源网页最多读取的响应字节数，避免超大页面占用上下文和内存",
+    )
+    yandex_cookies: str = Field(
+        default="",
+        title="Yandex Cookie",
+        description="可选，Yandex 反爬时填写浏览器 Cookie 以提升稳定性",
+        json_schema_extra=ExtraField(is_secret=True, required=False).model_dump(),
+    )
+    google_serpapi_key: str = Field(
+        default="",
+        title="SerpApi Key",
+        description="可选，用于参考实现的 Google Lens 主引擎",
+        json_schema_extra=ExtraField(is_secret=True, required=False).model_dump(),
+    )
+    google_zenserp_key: str = Field(
+        default="",
+        title="Zenserp Key",
+        description="可选，用于 Google Lens 备用引擎",
+        json_schema_extra=ExtraField(is_secret=True, required=False).model_dump(),
+    )
+    google_search_country: str = Field(default="HK", title="Google 搜索地区")
+    google_search_language: str = Field(default="zh-CN", title="Google 搜索语言")
+    allow_third_party_image_host: bool = Field(
+        default=True,
+        title="允许第三方临时图床",
+        description="本地图搜 Yandex/Google Lens 时允许上传到临时图床；关闭后仅支持公网图片 URL",
+    )
+    webpage_cache_ttl: int = Field(
+        default=900,
+        title="网页内容缓存秒数",
+        description="相同来源网页在缓存有效期内复用抓取结果，减少重复请求；设为 0 可关闭",
+    )
+    search_timeout: int = Field(
+        default=30,
+        title="搜图请求超时秒数",
+        description="单个搜索引擎请求的超时时间，避免某个引擎拖慢全部结果",
     )
     allow_private_webpage_fetch: bool = Field(
         default=False,
@@ -141,6 +179,51 @@ class PicSearcherConfig(ConfigBase):
 config: PicSearcherConfig = plugin.get_config(PicSearcherConfig)
 
 _PYQUERY_READY = False
+_WEBPAGE_CACHE: Dict[str, Tuple[float, str]] = {}
+
+_ENGINE_ALIASES = {
+    "animetrace": "anime_trace",
+    "anime": "anime_trace",
+    "a": "anime_trace",
+    "saucenao": "saucenao",
+    "sauce": "saucenao",
+    "s": "saucenao",
+    "ehentai": "ehentai",
+    "e-hentai": "ehentai",
+    "e": "ehentai",
+    "yandex": "yandex",
+    "ydx": "yandex",
+    "y": "yandex",
+    "google": "google",
+    "lens": "google_lens",
+    "google_lens": "google_lens",
+    "baidu": "baidu",
+    "bd": "baidu",
+}
+
+_INTENT_ENGINE_WEIGHTS = {
+    "anime_trace": {
+        "角色": 10,
+        "人物": 8,
+        "是谁": 8,
+        "动漫": 8,
+        "动画": 6,
+        "番剧": 6,
+        "cos": 6,
+    },
+    "saucenao": {
+        "出处": 10,
+        "来源": 9,
+        "画师": 10,
+        "作者": 8,
+        "pixiv": 8,
+        "pid": 7,
+        "原图": 6,
+    },
+    "ehentai": {"本子": 10, "同人": 8, "汉化": 8, "漫画": 6, "r18": 8},
+    "yandex": {"相似": 10, "类似": 8, "找图": 5, "照片": 4},
+    "google": {"找原图": 10, "综合": 8, "商品": 6, "新闻": 6, "原图": 5},
+}
 
 
 def _is_url(s: str) -> bool:
@@ -161,6 +244,125 @@ def _get_proxy() -> Optional[str]:
 
 def _get_cfg() -> "PicSearcherConfig":
     return plugin.get_config(PicSearcherConfig)
+
+
+def _normalize_engine_name(engine: str) -> str:
+    normalized = _clean_text(engine).lower().replace(" ", "_")
+    return _ENGINE_ALIASES.get(normalized, normalized)
+
+
+def _infer_engine_from_intent(intent: str) -> Tuple[Optional[str], int]:
+    text = _clean_text(intent).lower()
+    if not text:
+        return None, 0
+    scores: Dict[str, int] = {}
+    for engine, keywords in _INTENT_ENGINE_WEIGHTS.items():
+        score = sum(weight for keyword, weight in keywords.items() if keyword.lower() in text)
+        if score:
+            scores[engine] = score
+    if not scores:
+        return None, 0
+    engine, score = max(scores.items(), key=lambda item: item[1])
+    return engine, score
+
+
+async def _get_recent_image_context(ctx: AgentCtx) -> Tuple[Optional[str], str]:
+    """从最近用户消息中提取图片和意图文本。
+
+    AgentCtx 本身不携带原始消息对象，因此从已持久化的聊天记录读取最近窗口。
+    只读取当前频道且跳过机器人消息，避免把机器人刚发送的结果图片误当成输入。
+    """
+    try:
+        from nekro_agent.models.db_chat_message import DBChatMessage
+        from nekro_agent.schemas.chat_message import ChatMessageSegmentImage
+        from nekro_agent.tools.path_convertor import convert_filename_to_access_path
+
+        messages = await (
+            DBChatMessage.filter(chat_key=ctx.chat_key)
+            .order_by("-send_timestamp")
+            .limit(12)
+        )
+    except Exception as exc:
+        core.logger.debug(f"读取最近消息图片失败: {exc}")
+        return None, ""
+
+    intent_parts: List[str] = []
+    for message in messages:
+        if str(message.sender_id) == "-1":
+            continue
+        content_text = _clean_text(getattr(message, "content_text", ""))
+        if content_text:
+            intent_parts.append(content_text[:240])
+        try:
+            segments = message.parse_content_data()
+        except Exception:
+            continue
+        for segment in segments:
+            if not isinstance(segment, ChatMessageSegmentImage):
+                continue
+            candidates: List[Path] = []
+            if segment.local_path:
+                candidates.append(Path(segment.local_path))
+            if segment.file_name:
+                candidates.append(convert_filename_to_access_path(segment.file_name, ctx.chat_key))
+            for candidate in candidates:
+                try:
+                    if candidate.exists():
+                        return str(ctx.fs.forward_file(candidate)), " ".join(reversed(intent_parts))
+                except (OSError, ValueError):
+                    continue
+            remote_url = _clean_text(segment.remote_url or "")
+            if _is_url(remote_url):
+                return remote_url, " ".join(reversed(intent_parts))
+    return None, " ".join(reversed(intent_parts))
+
+
+def _validate_image_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("图片地址必须是有效的 http/https URL")
+    if _is_private_host(parsed.hostname):
+        raise ValueError("已阻止抓取私网或本机图片地址")
+
+
+def _engine_selection(
+    cfg: PicSearcherConfig,
+    requested_engine: Optional[str],
+    intent: str,
+    context_text: str,
+) -> Tuple[List[str], str]:
+    enabled = [
+        name
+        for name, is_enabled in [
+            ("ascii2d", cfg.enable_ascii2d),
+            ("anime_trace", cfg.enable_anime_trace),
+            ("tracemoe", cfg.enable_tracemoe),
+            ("yandex", cfg.enable_yandex),
+            ("google", cfg.enable_google),
+            ("iqdb", cfg.enable_iqdb),
+            ("baidu", cfg.enable_baidu),
+            ("bing", cfg.enable_bing),
+            ("google_lens", cfg.enable_google_lens),
+            ("lenso", cfg.enable_lenso),
+            ("copyseeker", cfg.enable_copyseeker),
+            ("saucenao", cfg.enable_saucenao),
+            ("tineye", cfg.enable_tineye),
+            ("ehentai", cfg.enable_ehentai),
+            ("exhentai", cfg.enable_exhentai),
+        ]
+        if is_enabled
+    ]
+    if requested_engine:
+        selected = _normalize_engine_name(requested_engine)
+        if selected not in enabled:
+            raise ValueError(f"引擎 {requested_engine} 未启用或不存在")
+        return [selected], f"指定引擎：{selected}"
+
+    inferred, score = _infer_engine_from_intent(intent or context_text)
+    if inferred and inferred in enabled and score >= 7:
+        return [inferred], f"按意图优先使用：{inferred}（匹配分 {score}）"
+    return enabled, "多引擎并行模式"
+
 
 def _ensure_pyquery() -> None:
     global _PYQUERY_READY
@@ -494,21 +696,35 @@ def _collect_result_evidence(engine: str, item: Dict[str, Any]) -> List[str]:
 def _flatten_search_results(search_results: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
     flattened: List[Dict[str, Any]] = []
     seen_urls: set[str] = set()
+    seen_no_url: set[str] = set()
     order = 0
     for result in search_results:
         engine = str(result.get("engine") or "")
-        for item in result.get("items", []):
+        for item_index, item in enumerate(result.get("items", []), 1):
             url = str(item.get("url") or item.get("video") or item.get("image") or "").strip()
-            if not _is_url(url) or url in seen_urls:
-                continue
-            seen_urls.add(url)
+            if _is_url(url):
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+            else:
+                # AnimeTrace 等识别型引擎通常只返回角色/作品文本，没有网页 URL；
+                # 这类结果仍然是高价值证据，不能因为无法抓网页而被聚合器丢弃。
+                identity = "|".join(
+                    _clean_text(str(item.get(key) or ""))
+                    for key in ("title", "source", "author", "site_name", "index_name")
+                )
+                if not identity or identity in seen_no_url:
+                    continue
+                seen_no_url.add(identity)
             order += 1
             flattened.append(
                 {
                     "order": order,
                     "engine": engine,
+                    "item_index": item_index,
                     "item": item,
                     "url": url,
+                    "fetchable": bool(url),
                     "reasons": _collect_result_evidence(engine, item),
                 }
             )
@@ -589,6 +805,14 @@ async def _try_fetch_once(url: str, use_proxy: bool, cfg: PicSearcherConfig) -> 
 
 
 async def _fetch_webpage_text(url: str, cfg: PicSearcherConfig) -> str:
+    cache_ttl = max(0, int(cfg.webpage_cache_ttl))
+    if cache_ttl > 0:
+        cached = _WEBPAGE_CACHE.get(url)
+        if cached and time.time() - cached[0] <= cache_ttl:
+            return cached[1]
+        if cached:
+            _WEBPAGE_CACHE.pop(url, None)
+
     proxies = _get_proxy()
     prefer_proxy = bool(cfg.webpage_prefer_proxy) and bool(proxies)
     try_fallback = bool(cfg.webpage_try_fallback) and bool(proxies)
@@ -597,14 +821,26 @@ async def _fetch_webpage_text(url: str, cfg: PicSearcherConfig) -> str:
     first_exc = None
 
     try:
-        return await _try_fetch_once(url, first_use_proxy, cfg)
+        text = await _try_fetch_once(url, first_use_proxy, cfg)
+        if cache_ttl > 0:
+            if len(_WEBPAGE_CACHE) >= 256:
+                oldest = min(_WEBPAGE_CACHE, key=lambda key: _WEBPAGE_CACHE[key][0])
+                _WEBPAGE_CACHE.pop(oldest, None)
+            _WEBPAGE_CACHE[url] = (time.time(), text)
+        return text
     except Exception as ex:
         first_exc = ex
         if not try_fallback:
             raise
 
     try:
-        return await _try_fetch_once(url, not first_use_proxy, cfg)
+        text = await _try_fetch_once(url, not first_use_proxy, cfg)
+        if cache_ttl > 0:
+            if len(_WEBPAGE_CACHE) >= 256:
+                oldest = min(_WEBPAGE_CACHE, key=lambda key: _WEBPAGE_CACHE[key][0])
+                _WEBPAGE_CACHE.pop(oldest, None)
+            _WEBPAGE_CACHE[url] = (time.time(), text)
+        return text
     except Exception as second_exc:
         raise first_exc or second_exc
 
@@ -648,6 +884,20 @@ async def _enrich_ranked_result(entry: Dict[str, Any], cfg: PicSearcherConfig) -
         }
 
 
+async def _enrich_without_webpage(
+    entry: Dict[str, Any],
+    skipped: bool = False,
+) -> Dict[str, Any]:
+    reason = "未抓取网页" if skipped else "结果不含可抓取网页 URL"
+    return {
+        **entry,
+        "page_summary": "",
+        "page_error": "skipped for performance" if skipped else "no source url",
+        "page_evidence": [reason],
+        "page_evidence_summary": reason,
+    }
+
+
 async def _enrich_trusted_results(
     search_results: List[Dict[str, Any]],
     cfg: PicSearcherConfig,
@@ -667,19 +917,16 @@ async def _enrich_trusted_results(
 
     enriched_full: List[Optional[Dict[str, Any]]] = []
     if use_fetch_top > 0:
-        enriched_top = await asyncio.gather(*[_enrich_ranked_result(entry, cfg) for entry in flattened[:use_fetch_top]])
+        enriched_top = await asyncio.gather(
+            *[
+                _enrich_ranked_result(entry, cfg) if entry.get("fetchable") else _enrich_without_webpage(entry)
+                for entry in flattened[:use_fetch_top]
+            ]
+        )
         enriched_full.extend(enriched_top)
 
     for entry in flattened[use_fetch_top:]:
-        enriched_full.append(
-            {
-                **entry,
-                "page_summary": "",
-                "page_error": "skipped for performance",
-                "page_evidence": ["未抓取网页"],
-                "page_evidence_summary": "未抓取网页",
-            }
-        )
+        enriched_full.append(await _enrich_without_webpage(entry, skipped=True))
 
     finalized: List[Dict[str, Any]] = []
     for entry in enriched_full:
@@ -810,6 +1057,10 @@ def _build_enriched_lookup(entries: List[Dict[str, Any]]) -> Dict[str, Dict[str,
         url = str(entry.get("url") or "").strip()
         if _is_url(url):
             lookup[url] = entry
+        engine = str(entry.get("engine") or "")
+        item_index = entry.get("item_index")
+        if engine and item_index is not None:
+            lookup[f"{engine}:{item_index}"] = entry
     return lookup
 
 
@@ -817,6 +1068,8 @@ def _build_result_risk_flags(entry: Dict[str, Any]) -> List[str]:
     flags: List[str] = []
     if entry.get("page_error") == "skipped for performance":
         flags.append("未抓网页")
+    elif entry.get("page_error") == "no source url":
+        flags.append("无来源网页 URL")
     elif entry.get("page_error") == "empty":
         flags.append("网页正文为空")
     elif entry.get("page_error"):
@@ -1008,21 +1261,140 @@ def _fmt_tineye(item: Any) -> Dict[str, Any]:
     }
 
 
+def _build_exhentai_cookie(cfg: PicSearcherConfig) -> str:
+    pairs = {
+        "ipb_member_id": cfg.exhentai_cookie_member_id,
+        "ipb_pass_hash": cfg.exhentai_cookie_pass_hash,
+        "igneous": cfg.exhentai_cookie_igneous,
+    }
+    return "; ".join(f"{key}={value}" for key, value in pairs.items() if value)
+
+
+async def _do_reference_search(
+    engine: str,
+    cfg: PicSearcherConfig,
+    top_k: int,
+    file_arg: Dict[str, Any],
+    proxy: Optional[str],
+    options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """使用参考插件的统一请求/解析链路执行核心引擎。"""
+    opts = dict(options or {})
+    normalized = engine.lower()
+    reference_name = "google" if normalized == "google_lens" else normalized
+    default_params: Dict[str, Dict[str, Any]] = {}
+    if reference_name == "yandex":
+        default_params["yandex"] = {
+            "cookies": cfg.yandex_cookies or None,
+            "max_results": top_k,
+            "use_ru_fallback": opts.pop("use_ru_fallback", True),
+        }
+    elif reference_name == "saucenao":
+        default_params["saucenao"] = {"api_key": cfg.saucenao_api_key or None}
+    elif reference_name == "google":
+        default_params["google"] = {
+            "serpapi_key": cfg.google_serpapi_key or None,
+            "zenserp_key": cfg.google_zenserp_key or None,
+            "country": cfg.google_search_country,
+            "hl": cfg.google_search_language,
+            "max_results": top_k,
+        }
+    elif reference_name in {"ehentai", "exhentai"}:
+        default_params[reference_name] = {
+            "is_ex": reference_name == "exhentai",
+            "cookies": _build_exhentai_cookie(cfg) or None,
+        }
+
+    model = BaseSearchModel(
+        proxies=proxy,
+        timeout=max(1, cfg.search_timeout),
+        default_params=default_params,
+        allow_third_party_image_host=cfg.allow_third_party_image_host,
+    )
+    response = await model.search(reference_name, **file_arg, **opts)
+    raw_items = list(getattr(response, "raw", []) or [])
+    items: List[Dict[str, Any]] = []
+    if reference_name in {"animetrace", "anime_trace"}:
+        for raw_item in raw_items[: max(1, top_k)]:
+            for character in getattr(raw_item, "characters", []) or []:
+                items.append(
+                    {
+                        "title": getattr(character, "name", ""),
+                        "source": getattr(character, "work", ""),
+                        "url": "",
+                        "thumbnail": "",
+                        "ai_detected": getattr(response, "ai", None),
+                    }
+                )
+    elif reference_name == "saucenao":
+        items = [
+            {
+                "title": getattr(item, "title", ""),
+                "author": getattr(item, "author", ""),
+                "author_url": getattr(item, "author_url", ""),
+                "url": getattr(item, "url", ""),
+                "thumbnail": getattr(item, "thumbnail", ""),
+                "similarity": getattr(item, "similarity", None),
+                "index_name": getattr(item, "index_name", ""),
+                "source": getattr(item, "source", ""),
+            }
+            for item in raw_items[: max(1, top_k)]
+        ]
+    elif reference_name == "yandex":
+        items = [
+            {
+                "title": getattr(item, "title", ""),
+                "url": getattr(item, "url", ""),
+                "thumbnail": getattr(item, "thumbnail", ""),
+                "source": getattr(item, "source", ""),
+                "author": getattr(item, "author", ""),
+                "content": getattr(item, "other_info", ""),
+            }
+            for item in raw_items[: max(1, top_k)]
+        ]
+    elif reference_name == "google":
+        items = [
+            {
+                "title": getattr(item, "title", ""),
+                "url": getattr(item, "url", ""),
+                "thumbnail": getattr(item, "thumbnail", ""),
+                "source": getattr(item, "source", ""),
+                "group": getattr(item, "group", ""),
+            }
+            for item in raw_items[: max(1, top_k)]
+        ]
+    else:
+        items = [
+            {
+                "title": getattr(item, "title", ""),
+                "url": getattr(item, "url", ""),
+                "thumbnail": getattr(item, "thumbnail", ""),
+                "type": getattr(item, "type", ""),
+                "date": getattr(item, "date", ""),
+                "pages": getattr(item, "pages", ""),
+                "tags": getattr(item, "tags", []),
+            }
+            for item in raw_items[: max(1, top_k)]
+        ]
+    output_engine = "anime_trace" if reference_name in {"animetrace", "anime_trace"} else normalized
+    return {"engine": output_engine, "url": getattr(response, "url", ""), "items": items}
+
+
 @plugin.mount_prompt_inject_method("picsearcher_image_source_analysis")
 async def picsearcher_prompt_inject(_ctx: AgentCtx) -> str:
     return (
         "【核心规则】识别图片时必须优先调用搜图工具：\n"
-        "1. 只要用户让你识别图片、解释图片内容、确认图片里的人物是谁、来自哪里、出自什么作品、作者/画师是谁、哪些网站能找到这张图，或要求考据图片来源、判断是否被搬运/误传时，**必须先调用 `render_multi_engine_search` 进行反向搜图，绝不能只用视觉模态回答**。\n"
+        "1. 只要用户让你识别图片、解释图片内容、确认图片里的人物是谁、来自哪里、出自什么作品、作者/画师是谁、哪些网站能找到这张图，或要求考据图片来源、判断是否被搬运/误传时，**必须先调用 `reverse_search`（或兼容名称 `render_multi_engine_search`）进行反向搜图，绝不能只用视觉模态回答**。\n"
         "2. 即使你认为自己“看出来了”，也要调用搜图工具交叉验证，避免幻觉；但**不要把工具输出里的顺序、字段或文本候选直接当作最终结论**。\n"
         "3. 这个工具只负责提供候选结果、网页摘录、实体文本、页面证据和客观状态；**调用完成后你必须继续分析，并直接给用户输出结论、证据和不确定性，不能停在工具原始结果或候选列表上**。\n"
         "4. 如果多个搜图结果不一致，要主动比较网页正文、域名、标题、作者、相似度与画面细节，并明确说明不确定性；如果证据不足，也要明确说“暂时无法确定”以及差在哪些证据。\n"
         "5. 如果你在 `/exec` 或 Python 脚本场景中调用此工具，绝对不要把自然语言结果、Markdown 表格、emoji 或项目符号直接写进 Python 代码；如需展示结果，只能在代码里用字符串包裹后 `print(...)`，或在脚本结束后再用自然语言回答。\n"
         "【工具说明】\n"
-        "- `render_multi_engine_search` 会在多个图片搜索引擎上同时反向搜图，整理候选结果、网页摘录、实体文本与页面证据，供你继续分析。\n"
+        "- `reverse_search` / `render_multi_engine_search` 会自动取当前消息图片，按意图选择引擎或执行多引擎反向搜图，并整理候选结果、网页摘录、实体文本与页面证据，供你继续分析。\n"
         "- 可选参数（按需使用）：\n"
         "  - `fast_mode=True`：跳过网页抓取，响应最快，适合只需要快速知道角色名/游戏名/作品名的场景；\n"
         "  - `fetch_webpage_for_top=N`：只对前 N 条抓网页，后面保留搜图信息以平衡速度与信息量；\n"
-        "  - 一般默认不用传额外参数，直接 `render_multi_engine_search(image=...)` 即可。"
+        "  - 一般默认不用传额外参数，直接 `reverse_search()` 即可；需要显式指定图片时传 `image=...`。"
     )
 
 
@@ -1038,17 +1410,33 @@ async def _do_search_single(
     if options is None:
         options = {}
 
+    # 核心引擎优先走参考插件的统一请求/解析实现；其余引擎继续兼容旧适配器。
+    if e in {"anime_trace", "animetrace", "anime", "saucenao", "nao", "yandex", "ydx", "y"}:
+        reference_engine = {
+            "anime": "animetrace",
+            "anime_trace": "animetrace",
+            "nao": "saucenao",
+            "ydx": "yandex",
+            "y": "yandex",
+        }.get(e, e)
+        return await _do_reference_search(reference_engine, cfg, top_k, file_arg, proxy, options)
+    if e in {"ehentai", "exhentai", "e-hentai"}:
+        reference_engine = "exhentai" if e == "exhentai" else "ehentai"
+        return await _do_reference_search(reference_engine, cfg, top_k, file_arg, proxy, options)
+    if e in {"google_lens", "lens"} and (cfg.google_serpapi_key or cfg.google_zenserp_key):
+        return await _do_reference_search("google", cfg, top_k, file_arg, proxy, options)
+
     if e in {"ascii2d", "asc"}:
         bovw = options.get("bovw", cfg.ascii2d_bovw)
         _ensure_pyquery()
-        cli = Ascii2D(bovw=bovw, proxies=proxy)
+        cli = Ascii2D(bovw=bovw, proxies=proxy, timeout=max(1, cfg.search_timeout))
         resp = await cli.search(**file_arg)
         items = [*resp.raw][: max(1, top_k)]
         return {"engine": "ascii2d", "url": resp.url, "items": [_fmt_ascii2d(i) for i in items]}
     if e in {"tracemoe", "trace"}:
         mute = bool(options.get("mute", False))
         size = options.get("size")
-        cli = TraceMoe(mute=mute, size=size, proxies=proxy)
+        cli = TraceMoe(mute=mute, size=size, proxies=proxy, timeout=max(1, cfg.search_timeout))
         resp = await cli.search(
             key=options.get("key"),
             anilist_id=options.get("anilist_id"),
@@ -1060,13 +1448,13 @@ async def _do_search_single(
         return {"engine": "tracemoe", "url": resp.url, "items": [_fmt_tracemoe(i) for i in items]}
     if e in {"yandex", "ydx"}:
         _ensure_pyquery()
-        cli = Yandex(proxies=proxy)
+        cli = Yandex(proxies=proxy, timeout=max(1, cfg.search_timeout))
         resp = await cli.search(**file_arg)
         items = [*resp.raw][: max(1, top_k)]
         return {"engine": "yandex", "url": resp.url, "items": [_fmt_yandex(i) for i in items]}
     if e in {"google", "ggl"}:
         _ensure_pyquery()
-        cli = Google(proxies=proxy)
+        cli = Google(proxies=proxy, timeout=max(1, cfg.search_timeout))
         resp = await cli.search(**file_arg)
         items = [*resp.raw][: max(1, top_k)]
         return {"engine": "google", "url": resp.url, "items": [_fmt_google(i) for i in items]}
@@ -1074,13 +1462,13 @@ async def _do_search_single(
         _ensure_pyquery()
         is_3d = bool(options.get("is_3d", False))
         force_gray = bool(options.get("force_gray", False))
-        cli = Iqdb(is_3d=is_3d, proxies=proxy)
+        cli = Iqdb(is_3d=is_3d, proxies=proxy, timeout=max(1, cfg.search_timeout))
         resp = await cli.search(force_gray=force_gray, **file_arg)
         items = [*resp.raw][: max(1, top_k)]
         return {"engine": "iqdb", "url": resp.url, "items": [_fmt_iqdb(i) for i in items]}
     if e in {"baidu", "bd"}:
         _ensure_pyquery()
-        cli = BaiDu(proxies=proxy)
+        cli = BaiDu(proxies=proxy, timeout=max(1, cfg.search_timeout))
         resp = await cli.search(**file_arg)
         pool = resp.exact_matches or resp.raw
         items = pool[: max(1, top_k)]
@@ -1091,12 +1479,12 @@ async def _do_search_single(
         for key in ["numres", "hide", "minsim", "output_type", "testmode", "dbmask", "dbmaski", "db", "dbs"]:
             if key in options and options[key] is not None:
                 saucenao_kwargs[key] = options[key]
-        cli = SauceNAO(api_key=api_key, proxies=proxy, **saucenao_kwargs)
+        cli = SauceNAO(api_key=api_key, proxies=proxy, timeout=max(1, cfg.search_timeout), **saucenao_kwargs)
         resp = await cli.search(**file_arg)
         items = [*resp.raw][: max(1, top_k)]
         return {"engine": "saucenao", "url": resp.url, "items": [_fmt_saucenao(i) for i in items]}
     if e in {"bing"}:
-        cli = Bing(proxies=proxy)
+        cli = Bing(proxies=proxy, timeout=max(1, cfg.search_timeout))
         resp = await cli.search(**file_arg)
         pool = getattr(resp, "pages_including", []) or getattr(resp, "visual_search", [])
         items = pool[: max(1, top_k)]
@@ -1107,19 +1495,26 @@ async def _do_search_single(
         hl = options.get("hl", "en")
         country = options.get("country", "US")
         _ensure_pyquery()
-        cli = GoogleLens(search_type=search_type, q=q, hl=hl, country=country, proxies=proxy)
+        cli = GoogleLens(
+            search_type=search_type,
+            q=q,
+            hl=hl,
+            country=country,
+            proxies=proxy,
+            timeout=max(1, cfg.search_timeout),
+        )
         resp = await cli.search(q=q, **file_arg)
         items = [*resp.raw][: max(1, top_k)]
         return {"engine": "google_lens", "url": resp.url, "items": [_fmt_glens(i) for i in items]}
     if e in {"lenso"}:
         search_type = options.get("search_type", "") if options else ""
         sort_type = options.get("sort_type", "SMART") if options else "SMART"
-        cli = Lenso(proxies=proxy)
+        cli = Lenso(proxies=proxy, timeout=max(1, cfg.search_timeout))
         resp = await cli.search(search_type=search_type, sort_type=sort_type, **file_arg)
         items = [*resp.raw][: max(1, top_k)]
         return {"engine": "lenso", "url": resp.url, "items": [_fmt_lenso(i) for i in items]}
     if e in {"copyseeker", "copy"}:
-        cli = Copyseeker(proxies=proxy)
+        cli = Copyseeker(proxies=proxy, timeout=max(1, cfg.search_timeout))
         resp = await cli.search(**file_arg)
         items = [*resp.raw][: max(1, top_k)]
         return {"engine": "copyseeker", "url": resp.url, "items": [_fmt_copyseeker(i) for i in items]}
@@ -1128,6 +1523,7 @@ async def _do_search_single(
             is_multi=options.get("is_multi"),
             ai_detect=options.get("ai_detect"),
             proxies=proxy,
+            timeout=max(1, cfg.search_timeout),
         )
         model_name = options.get("model")
         base64_data = options.get("base64")
@@ -1135,10 +1531,22 @@ async def _do_search_single(
             resp = await cli.search(base64=base64_data, model=model_name)
         else:
             resp = await cli.search(model=model_name, **file_arg)
-        items = [*resp.raw][: max(1, top_k)]
-        return {"engine": "anime_trace", "url": resp.url, "items": [_fmt_anime_trace(i) for i in items]}
+        anime_items: List[Dict[str, Any]] = []
+        for raw_item in [*resp.raw][: max(1, top_k)]:
+            characters = getattr(raw_item, "characters", None) or []
+            for character in characters:
+                anime_items.append(
+                    {
+                        "title": getattr(character, "name", ""),
+                        "source": getattr(character, "work", ""),
+                        "url": "",
+                        "thumbnail": "",
+                        "ai_detected": getattr(resp, "ai", None),
+                    }
+                )
+        return {"engine": "anime_trace", "url": resp.url, "items": anime_items[: max(1, top_k * 3)]}
     if e in {"tineye", "tine"}:
-        cli = Tineye(proxies=proxy)
+        cli = Tineye(proxies=proxy, timeout=max(1, cfg.search_timeout))
         resp = await cli.search(
             show_unavailable_domains=bool(options.get("show_unavailable_domains", False)),
             domain=options.get("domain", ""),
@@ -1170,6 +1578,7 @@ async def _do_search_single(
             exp=bool(options.get("exp", False)),
             **exhentai_kwargs,
             proxies=proxy,
+            timeout=max(1, cfg.search_timeout),
         )
         resp = await cli.search(**file_arg)
         items = [*resp.raw][: max(1, top_k)]
@@ -1198,7 +1607,13 @@ async def _do_search_single_safe(
 )
 async def render_multi_engine_search(
     _ctx: AgentCtx,
-    *args: Any,
+    image: Optional[str] = None,
+    engine: Optional[str] = None,
+    intent: Optional[str] = None,
+    top_k: Optional[int] = None,
+    options: Optional[Dict[str, Any]] = None,
+    fast_mode: Optional[bool] = None,
+    fetch_webpage_for_top: Optional[int] = None,
     **kwargs: Any,
 ) -> str:
     """
@@ -1207,8 +1622,9 @@ async def render_multi_engine_search(
 
     Args:
         _ctx (AgentCtx): 调用上下文（自动注入）
-        image (str): 图片地址（http/https URL 或 AI 沙盒文件路径）
-        enable_* (config): 通过配置项控制引擎启用或关闭
+        image (str | None): 图片地址（http/https URL 或 AI 沙盒文件路径）。省略时自动使用最近一条用户图片或引用图片。
+        engine (str | None): 指定单个引擎，可用 `animetrace`、`saucenao`、`ehentai`、`yandex` 等别名；省略时按意图路由或多引擎并行。
+        intent (str | None): 搜索意图，如“找角色”“找出处/画师”“找相似图”，用于选择更合适的引擎。
         top_k (int | None): 每个引擎返回的最大条数，默认使用配置项 max_results
         options (dict | None): 引擎可选项，示例
             - ascii2d: {"bovw": true}
@@ -1243,14 +1659,26 @@ async def render_multi_engine_search(
             fetch_webpage_for_top=2
         )
     """
-    image: Optional[str] = kwargs.pop("image", None) or (args[0] if len(args) > 0 else None)
-    top_k: Optional[int] = kwargs.pop("top_k", None)
-    options: Optional[Dict[str, Any]] = kwargs.pop("options", None)
-    fast_mode: Optional[bool] = kwargs.pop("fast_mode", None)
-    fetch_webpage_for_top: Optional[int] = kwargs.pop("fetch_webpage_for_top", None)
-    if not image:
-        raise ValueError("缺少参数 image")
+    # 兼容旧版通过 kwargs 传参的调用方式。
+    image = image or kwargs.pop("image", None)
+    engine = engine or kwargs.pop("engine", None)
+    intent = intent or kwargs.pop("intent", None)
+    if top_k is None:
+        top_k = kwargs.pop("top_k", None)
+    if options is None:
+        options = kwargs.pop("options", None)
+    if fast_mode is None:
+        fast_mode = kwargs.pop("fast_mode", None)
+    if fetch_webpage_for_top is None:
+        fetch_webpage_for_top = kwargs.pop("fetch_webpage_for_top", None)
     cfg = _get_cfg()
+    recent_context_text = ""
+    if not image:
+        image, recent_context_text = await _get_recent_image_context(_ctx)
+    if not image:
+        raise ValueError("未找到图片，请在消息中附图，或传入 image 图片地址/沙盒路径")
+    if _is_url(image):
+        await asyncio.to_thread(_validate_image_url, image)
     if top_k is None:
         k = int(cfg.max_results)
     else:
@@ -1260,27 +1688,7 @@ async def render_multi_engine_search(
             raise ValueError("top_k 必须是大于等于 1 的整数")
         if k < 1:
             raise ValueError("top_k 必须是大于等于 1 的整数")
-    engs = [
-        name
-        for name, enabled in [
-            ("ascii2d", cfg.enable_ascii2d),
-            ("anime_trace", cfg.enable_anime_trace),
-            ("tracemoe", cfg.enable_tracemoe),
-            ("yandex", cfg.enable_yandex),
-            ("google", cfg.enable_google),
-            ("iqdb", cfg.enable_iqdb),
-            ("baidu", cfg.enable_baidu),
-            ("bing", cfg.enable_bing),
-            ("google_lens", cfg.enable_google_lens),
-            ("lenso", cfg.enable_lenso),
-            ("copyseeker", cfg.enable_copyseeker),
-            ("saucenao", cfg.enable_saucenao),
-            ("tineye", cfg.enable_tineye),
-            ("ehentai", cfg.enable_ehentai),
-            ("exhentai", cfg.enable_exhentai),
-        ]
-        if enabled
-    ]
+    engs, selection_info = _engine_selection(cfg, engine, intent or "", recent_context_text)
     if not engs:
         raise ValueError("未启用任何引擎，请在配置中开启至少一个引擎")
     file_arg = _build_file_arg(image, _ctx)
@@ -1310,6 +1718,7 @@ async def render_multi_engine_search(
         mode_info.append(f"常规模式：仅对前 {use_fetch_top} 条候选结果抓取来源网页，后面结果保留搜图信息以提升速度")
     lines: list[str] = [
         f"Image: {image}",
+        f"引擎策略：{selection_info}",
         "效率说明：" + "；".join(mode_info),
         "阅读提示：上方候选线索汇总是为了帮助快速定位方向，详细网页证据与原始命中结果在后文。",
     ]
@@ -1340,7 +1749,7 @@ async def render_multi_engine_search(
             lines.append(note)
         lines.append("\n[候选结果数据]")
         lines.append("说明：本区按引擎分组展示原始命中结果，不做跨引擎全局合并；全局层面仅额外提示重复 URL。")
-        lines.append(f"搜索概况：已启用 {len(engs)} 个引擎，成功返回 {len(search_results)} 个引擎结果，整理出 {len(trusted)} 条可读网页证据。")
+        lines.append(f"搜索概况：已启用 {len(engs)} 个引擎，成功返回 {len(search_results)} 个引擎结果，整理出 {len(trusted)} 条可读证据。")
         lines.append("跨结果提示：" + "；".join(consensus_hints))
         if duplicate_url_hints:
             lines.append("重复 URL 提示：" + "；".join(duplicate_url_hints))
@@ -1375,9 +1784,7 @@ async def render_multi_engine_search(
                 if item_url:
                     line += f" -> {item_url}"
                 lines.append(line)
-                if not _is_url(item_url):
-                    continue
-                entry = enriched_lookup.get(item_url)
+                entry = enriched_lookup.get(item_url) if _is_url(item_url) else enriched_lookup.get(f"{engine}:{idx}")
                 if not entry:
                     lines.append("页面证据：未整理 | 说明：未纳入网页整理范围")
                     continue
@@ -1401,7 +1808,11 @@ async def render_multi_engine_search(
                 if entry.get("page_summary"):
                     lines.append(f"网页正文：{_safe_output_text(entry['page_summary'], cfg.webpage_content_chars)}")
                 if entry.get("page_error") and entry.get("page_error") != "empty":
-                    lines.append(f"网页处理提示：{_safe_output_text(entry['page_error'], 240)}")
+                    page_error = entry.get("page_error")
+                    if page_error == "no source url":
+                        lines.append("网页处理提示：该识别结果不含来源网页 URL，已保留文本证据")
+                    else:
+                        lines.append(f"网页处理提示：{_safe_output_text(page_error, 240)}")
                 elif entry.get("page_error"):
                     lines.append(f"网页内容获取失败：{_safe_output_text(entry['page_error'], 240)}")
     else:
@@ -1444,3 +1855,46 @@ async def render_multi_engine_search(
     lines.append("先给出当前最可能的身份/出处/作者判断，再说明关键证据来自哪些引擎、页面或重复 URL。")
     lines.append("如果证据冲突或不足，请明确保留不确定性，并说明还缺什么证据。")
     return "\n".join(lines)
+
+
+@plugin.mount_sandbox_method(
+    method_type=SandboxMethodType.AGENT,
+    name="reverse_search",
+    description="以图搜图入口：自动从当前消息取图，并按‘找角色/找出处/找相似图’等意图选择引擎。",
+)
+async def reverse_search(
+    _ctx: AgentCtx,
+    image: Optional[str] = None,
+    engine: Optional[str] = None,
+    intent: Optional[str] = None,
+    top_k: Optional[int] = None,
+    options: Optional[Dict[str, Any]] = None,
+    fast_mode: Optional[bool] = None,
+    fetch_webpage_for_top: Optional[int] = None,
+    **kwargs: Any,
+) -> str:
+    """以图搜图的简洁入口，功能与 `render_multi_engine_search` 相同。
+
+    Args:
+        image (str | None): 图片 URL 或 AI 沙盒路径；省略时自动使用当前消息图片。
+        engine (str | None): 可选，指定 `animetrace`、`saucenao`、`yandex` 等引擎。
+        intent (str | None): 可选，说明“找角色”“找出处/画师”“找相似图”等目标。
+        top_k (int | None): 每个引擎返回的最大结果数。
+        options (dict | None): 引擎专属参数。
+        fast_mode (bool | None): 是否跳过来源网页抓取。
+        fetch_webpage_for_top (int | None): 仅抓取前 N 条候选网页。
+
+    Returns:
+        str: 搜图候选、证据和网页摘录，供后续回答使用。
+    """
+    return await render_multi_engine_search(
+        _ctx,
+        image=image,
+        engine=engine,
+        intent=intent,
+        top_k=top_k,
+        options=options,
+        fast_mode=fast_mode,
+        fetch_webpage_for_top=fetch_webpage_for_top,
+        **kwargs,
+    )
