@@ -431,7 +431,7 @@ def _collect_entry_entities(entry: Dict[str, Any]) -> Dict[str, List[str]]:
 
     if domain:
         entities["sites"].append(domain)
-    for site_value in [item.get("site_name"), item.get("source")]:
+    for site_value in [item.get("site_name")]:
         for candidate in _split_candidate_text(str(site_value or "")):
             if _is_meaningful_candidate(candidate) and len(candidate) <= 40:
                 entities["sites"].append(candidate)
@@ -456,11 +456,11 @@ def _collect_entry_entities(entry: Dict[str, Any]) -> Dict[str, List[str]]:
             if _is_meaningful_candidate(candidate):
                 entities["works"].append(candidate)
     else:
-        # 其他引擎通常标题和来源都包含重要信息，全部收集供 AI 判断
-        for text in [title_text, source_text]:
-            for candidate in _split_candidate_text(text):
-                if _is_meaningful_candidate(candidate):
-                    entities["objects"].append(candidate)
+        # 通用引擎的 source 字段经常混入站点名或分发页文案，容易误导判断；
+        # 因此这里只保留标题中的主题片段，把 source 留给原始证据区供 AI 自行比对。
+        for candidate in _split_candidate_text(title_text):
+            if _is_meaningful_candidate(candidate):
+                entities["objects"].append(candidate)
 
     # 显式标签提取
     entities["authors"].extend(_extract_tag_values(item, ["artist:", "creator:", "author:", "group:", "circle:"]))
@@ -752,11 +752,11 @@ def _build_candidate_snapshot(trusted: List[Dict[str, Any]]) -> List[str]:
             _add_candidate_occurrence(site_bucket, value, title)
     best = trusted[0]
     lines = [
-        f"人物/角色文本候选：{_format_bucket_with_evidence(character_bucket, 4, '暂无稳定角色文本')}",
-        f"作品/出处文本候选：{_format_bucket_with_evidence(work_bucket, 4, '暂无稳定作品或出处文本')}",
-        f"作者/画师文本候选：{_format_bucket_with_evidence(author_bucket, 4, '暂无稳定作者文本')}",
-        f"图片内容文本候选：{_format_bucket_with_evidence(object_bucket, 4, '暂无可直接归纳的主题文本')}",
-        f"站点分布候选：{_format_bucket_with_evidence(site_bucket, 6, _domain_of(best['url']) or '暂无明确站点')}",
+        f"人物/角色线索（仅显式角色字段）：{_format_bucket_with_evidence(character_bucket, 4, '暂无稳定角色文本')}",
+        f"作品/出处线索（仅显式作品字段）：{_format_bucket_with_evidence(work_bucket, 4, '暂无稳定作品或出处文本')}",
+        f"作者/画师线索：{_format_bucket_with_evidence(author_bucket, 4, '暂无稳定作者文本')}",
+        f"标题/主题文本片段（可能混有页面标题，不可直接当结论）：{_format_bucket_with_evidence(object_bucket, 4, '暂无可直接归纳的主题文本')}",
+        f"站点分布：{_format_bucket_with_evidence(site_bucket, 6, _domain_of(best['url']) or '暂无明确站点')}",
     ]
     return lines
 
@@ -765,8 +765,9 @@ def _build_data_usage_notes(trusted: List[Dict[str, Any]]) -> List[str]:
     if not trusted:
         return ["本次没有形成可读候选，需结合原图视觉内容自行判断。"]
     notes = [
-        "本工具只整理检索结果、网页摘录、文本提取和客观状态，不输出最终身份结论。",
-        "候选线索汇总会对可访问 URL 做去重整理；候选结果数据区按引擎展示原始命中，不代表事实正确率或可信度排序。",
+        "候选线索汇总只是文本片段聚合，不能直接当作最终身份、出处或作者结论。",
+        "标题/来源字段可能混入站点名、转载页标题、商品页文案或搜索页文案，必须与网页正文、页面证据和画面细节交叉核对。",
+        "候选结果数据区按引擎展示原始命中，不代表事实正确率或可信度排序。",
     ]
     if len(trusted) == 1:
         notes.append("当前仅有一个候选结果，证据覆盖面有限。")
@@ -1013,8 +1014,8 @@ async def picsearcher_prompt_inject(_ctx: AgentCtx) -> str:
         "【核心规则】识别图片时必须优先调用搜图工具：\n"
         "1. 只要用户让你识别图片、解释图片内容、确认图片里的人物是谁、来自哪里、出自什么作品、作者/画师是谁、哪些网站能找到这张图，或要求考据图片来源、判断是否被搬运/误传时，**必须先调用 `render_multi_engine_search` 进行反向搜图，绝不能只用视觉模态回答**。\n"
         "2. 即使你认为自己“看出来了”，也要调用搜图工具交叉验证，避免幻觉；但**不要把工具输出里的顺序、字段或文本候选直接当作最终结论**。\n"
-        "3. 这个工具只负责提供候选结果、网页摘录、实体文本、页面证据和客观状态；**最终判断必须由你结合视觉内容、上下文和这些证据自行推理**。\n"
-        "4. 如果多个搜图结果不一致，要主动比较网页正文、域名、标题、作者、相似度与画面细节，并明确说明不确定性。\n"
+        "3. 这个工具只负责提供候选结果、网页摘录、实体文本、页面证据和客观状态；**调用完成后你必须继续分析，并直接给用户输出结论、证据和不确定性，不能停在工具原始结果或候选列表上**。\n"
+        "4. 如果多个搜图结果不一致，要主动比较网页正文、域名、标题、作者、相似度与画面细节，并明确说明不确定性；如果证据不足，也要明确说“暂时无法确定”以及差在哪些证据。\n"
         "5. 如果你在 `/exec` 或 Python 脚本场景中调用此工具，绝对不要把自然语言结果、Markdown 表格、emoji 或项目符号直接写进 Python 代码；如需展示结果，只能在代码里用字符串包裹后 `print(...)`，或在脚本结束后再用自然语言回答。\n"
         "【工具说明】\n"
         "- `render_multi_engine_search` 会在多个图片搜索引擎上同时反向搜图，整理候选结果、网页摘录、实体文本与页面证据，供你继续分析。\n"
@@ -1193,7 +1194,7 @@ async def _do_search_single_safe(
 @plugin.mount_sandbox_method(
     method_type=SandboxMethodType.AGENT,
     name="render_multi_engine_search",
-    description="【优先调用】识别图片时先调用此工具。它负责反向搜索、整理候选结果、网页正文摘录、页面证据和客观状态，供 AI 自行推理，不直接代替 AI 下最终结论。",
+    description="【优先调用】识别图片时先调用此工具。它会返回反向搜索结果、网页证据与候选线索；拿到结果后必须继续综合分析并直接回答用户，不能停在候选列表。",
 )
 async def render_multi_engine_search(
     _ctx: AgentCtx,
@@ -1310,8 +1311,7 @@ async def render_multi_engine_search(
     lines: list[str] = [
         f"Image: {image}",
         "效率说明：" + "；".join(mode_info),
-        "使用原则：本工具只整理候选结果、网页摘录、文本提取、页面证据和客观状态，不输出最终身份/出处结论。",
-        "脚本安全提示：以下返回是纯文本证据，不要把自然语言、Markdown 表格、emoji 或项目符号直接写进 Python 代码；如需在 /exec 中展示，请用字符串后 print().",
+        "阅读提示：上方候选线索汇总是为了帮助快速定位方向，详细网页证据与原始命中结果在后文。",
     ]
     search_tasks = [
         _do_search_single_safe(e, cfg, k, file_arg, proxy, options)
@@ -1439,4 +1439,8 @@ async def render_multi_engine_search(
         if engine_errors:
             lines.append("\n[引擎异常]")
             lines.extend(engine_errors)
+    lines.append("\n[下一步回答要求]")
+    lines.append("请基于以上证据直接完成对用户的回答，不要只复述候选列表。")
+    lines.append("先给出当前最可能的身份/出处/作者判断，再说明关键证据来自哪些引擎、页面或重复 URL。")
+    lines.append("如果证据冲突或不足，请明确保留不确定性，并说明还缺什么证据。")
     return "\n".join(lines)
