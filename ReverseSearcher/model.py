@@ -15,7 +15,7 @@ from typing import Any
 from PIL import Image
 
 from .utils import Network
-from .utils.api_request import AnimeTrace, EHentai, GoogleLens, SauceNAO, Yandex
+from .utils.api_request import AnimeTrace, EHentai, SauceNAO, Yandex
 from .utils.response_parser.base_parser import BaseSearchResponse
 from .utils.security import is_safe_image_ref
 
@@ -24,15 +24,13 @@ ENGINE_MAP: dict[str, type] = {
     "anime_trace": AnimeTrace,
     "yandex": Yandex,
     "saucenao": SauceNAO,
-    "google": GoogleLens,
-    "google_lens": GoogleLens,
     "ehentai": EHentai,
     "exhentai": EHentai,
 }
 
 
 class BaseSearchModel:
-    """统一执行 AnimeTrace、SauceNAO、Yandex、Google Lens、E-Hentai。"""
+    """统一执行 AnimeTrace、SauceNAO、Yandex、E-Hentai。"""
 
     def __init__(
         self,
@@ -92,15 +90,6 @@ class BaseSearchModel:
                 "db": values.pop("db", 999),
                 "dbs": values.pop("dbs", None),
             }
-        if api in {"google", "google_lens"}:
-            api_keys = values.pop("api_keys", {}) or {}
-            return {
-                "serpapi_key": values.pop("serpapi_key", None) or api_keys.get("serpapi"),
-                "zenserp_key": values.pop("zenserp_key", None) or api_keys.get("zenserp"),
-                "country": values.pop("country", "HK"),
-                "hl": values.pop("hl", "zh-CN"),
-                "max_results": values.pop("max_results", 10),
-            }
         if api == "yandex":
             return {
                 "max_results": values.pop("max_results", 10),
@@ -131,7 +120,7 @@ class BaseSearchModel:
         params = {**self.default_params.get(normalized, {}), **kwargs}
         engine_params = self._prepare_engine_params(normalized, params)
         effective_cookies = engine_params.get("cookies") or self.cookies
-        if normalized in {"google", "google_lens", "yandex"} and file and not self.allow_third_party_image_host:
+        if normalized == "yandex" and file and not self.allow_third_party_image_host:
             raise ValueError("当前配置禁止本地图上传到第三方图床，无法使用该参考引擎")
 
         network_kwargs: dict[str, Any] = {"timeout": self.timeout}

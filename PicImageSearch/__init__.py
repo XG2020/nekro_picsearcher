@@ -11,7 +11,6 @@ __all__ = [
     "Copyseeker",
     "EHentai",
     "Google",
-    "GoogleLens",
     "Iqdb",
     "Lenso",
     "Network",

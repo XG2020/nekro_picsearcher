@@ -26,7 +26,6 @@ from .PicImageSearch.engines.yandex import Yandex
 from .PicImageSearch.engines.google import Google
 from .PicImageSearch.engines.iqdb import Iqdb
 from .PicImageSearch.engines.baidu import BaiDu
-from .PicImageSearch.engines.google_lens import GoogleLens
 from .PicImageSearch.engines.lenso import Lenso
 from .PicImageSearch.engines.copyseeker import Copyseeker
 from .PicImageSearch.engines.ehentai import EHentai
@@ -82,7 +81,6 @@ class PicSearcherConfig(ConfigBase):
     enable_anime_trace: bool = Field(default=True, title="启用 AnimeTrace")
     enable_tracemoe: bool = Field(default=False, title="启用 TraceMoe")
     enable_iqdb: bool = Field(default=False, title="启用 IQDB")
-    enable_google_lens: bool = Field(default=False, title="启用 Google Lens")
     enable_lenso: bool = Field(default=False, title="启用 Lenso")
     enable_copyseeker: bool = Field(default=False, title="启用 Copyseeker")
     enable_saucenao: bool = Field(default=True, title="启用 SauceNAO")
@@ -120,24 +118,10 @@ class PicSearcherConfig(ConfigBase):
         description="可选，Yandex 反爬时填写浏览器 Cookie 以提升稳定性",
         json_schema_extra=ExtraField(is_secret=True, required=False).model_dump(),
     )
-    google_serpapi_key: str = Field(
-        default="",
-        title="SerpApi Key",
-        description="可选，用于参考实现的 Google Lens 主引擎",
-        json_schema_extra=ExtraField(is_secret=True, required=False).model_dump(),
-    )
-    google_zenserp_key: str = Field(
-        default="",
-        title="Zenserp Key",
-        description="可选，用于 Google Lens 备用引擎",
-        json_schema_extra=ExtraField(is_secret=True, required=False).model_dump(),
-    )
-    google_search_country: str = Field(default="HK", title="Google 搜索地区")
-    google_search_language: str = Field(default="zh-CN", title="Google 搜索语言")
     allow_third_party_image_host: bool = Field(
         default=True,
         title="允许第三方临时图床",
-        description="本地图搜 Yandex/Google Lens 时允许上传到临时图床；关闭后仅支持公网图片 URL",
+        description="本地图搜 Yandex 时允许上传到临时图床；关闭后仅支持公网图片 URL",
     )
     webpage_cache_ttl: int = Field(
         default=900,
@@ -195,8 +179,6 @@ _ENGINE_ALIASES = {
     "ydx": "yandex",
     "y": "yandex",
     "google": "google",
-    "lens": "google_lens",
-    "google_lens": "google_lens",
     "baidu": "baidu",
     "bd": "baidu",
 }
@@ -342,7 +324,6 @@ def _engine_selection(
             ("iqdb", cfg.enable_iqdb),
             ("baidu", cfg.enable_baidu),
             ("bing", cfg.enable_bing),
-            ("google_lens", cfg.enable_google_lens),
             ("lenso", cfg.enable_lenso),
             ("copyseeker", cfg.enable_copyseeker),
             ("saucenao", cfg.enable_saucenao),
@@ -1154,19 +1135,6 @@ def _fmt_baidu(item: Any) -> Dict[str, Any]:
     }
 
 
-def _fmt_glens(item: Any) -> Dict[str, Any]:
-    out = {
-        "title": getattr(item, "title", ""),
-        "site_name": getattr(item, "site_name", ""),
-        "url": getattr(item, "url", ""),
-        "thumbnail": getattr(item, "thumbnail", ""),
-    }
-    size = getattr(item, "size", None)
-    if size:
-        out["size"] = size
-    return out
-
-
 def _fmt_ehentai(item: Any) -> Dict[str, Any]:
     return {
         "title": getattr(item, "title", ""),
@@ -1281,7 +1249,7 @@ async def _do_reference_search(
     """使用参考插件的统一请求/解析链路执行核心引擎。"""
     opts = dict(options or {})
     normalized = engine.lower()
-    reference_name = "google" if normalized == "google_lens" else normalized
+    reference_name = normalized
     default_params: Dict[str, Dict[str, Any]] = {}
     if reference_name == "yandex":
         default_params["yandex"] = {
@@ -1291,14 +1259,6 @@ async def _do_reference_search(
         }
     elif reference_name == "saucenao":
         default_params["saucenao"] = {"api_key": cfg.saucenao_api_key or None}
-    elif reference_name == "google":
-        default_params["google"] = {
-            "serpapi_key": cfg.google_serpapi_key or None,
-            "zenserp_key": cfg.google_zenserp_key or None,
-            "country": cfg.google_search_country,
-            "hl": cfg.google_search_language,
-            "max_results": top_k,
-        }
     elif reference_name in {"ehentai", "exhentai"}:
         default_params[reference_name] = {
             "is_ex": reference_name == "exhentai",
@@ -1349,17 +1309,6 @@ async def _do_reference_search(
                 "source": getattr(item, "source", ""),
                 "author": getattr(item, "author", ""),
                 "content": getattr(item, "other_info", ""),
-            }
-            for item in raw_items[: max(1, top_k)]
-        ]
-    elif reference_name == "google":
-        items = [
-            {
-                "title": getattr(item, "title", ""),
-                "url": getattr(item, "url", ""),
-                "thumbnail": getattr(item, "thumbnail", ""),
-                "source": getattr(item, "source", ""),
-                "group": getattr(item, "group", ""),
             }
             for item in raw_items[: max(1, top_k)]
         ]
@@ -1423,9 +1372,6 @@ async def _do_search_single(
     if e in {"ehentai", "exhentai", "e-hentai"}:
         reference_engine = "exhentai" if e == "exhentai" else "ehentai"
         return await _do_reference_search(reference_engine, cfg, top_k, file_arg, proxy, options)
-    if e in {"google_lens", "lens"} and (cfg.google_serpapi_key or cfg.google_zenserp_key):
-        return await _do_reference_search("google", cfg, top_k, file_arg, proxy, options)
-
     if e in {"ascii2d", "asc"}:
         bovw = options.get("bovw", cfg.ascii2d_bovw)
         _ensure_pyquery()
@@ -1489,23 +1435,6 @@ async def _do_search_single(
         pool = getattr(resp, "pages_including", []) or getattr(resp, "visual_search", [])
         items = pool[: max(1, top_k)]
         return {"engine": "bing", "url": resp.url, "items": [_fmt_bing_pages(i) for i in items]}
-    if e in {"google_lens", "lens"}:
-        search_type = options.get("lens_type") or options.get("search_type") or "all"
-        q = options.get("q")
-        hl = options.get("hl", "en")
-        country = options.get("country", "US")
-        _ensure_pyquery()
-        cli = GoogleLens(
-            search_type=search_type,
-            q=q,
-            hl=hl,
-            country=country,
-            proxies=proxy,
-            timeout=max(1, cfg.search_timeout),
-        )
-        resp = await cli.search(q=q, **file_arg)
-        items = [*resp.raw][: max(1, top_k)]
-        return {"engine": "google_lens", "url": resp.url, "items": [_fmt_glens(i) for i in items]}
     if e in {"lenso"}:
         search_type = options.get("search_type", "") if options else ""
         sort_type = options.get("sort_type", "SMART") if options else "SMART"
@@ -1630,7 +1559,6 @@ async def render_multi_engine_search(
             - ascii2d: {"bovw": true}
             - tracemoe: {"key": "...", "anilist_id": 123, "chinese_title": true, "cut_borders": true, "mute": false, "size": "m"}
             - iqdb: {"is_3d": false, "force_gray": false}
-            - google_lens: {"search_type": "all|products|visual_matches|exact_matches", "q": "...", "hl": "en", "country": "US"}
             - saucenao: {"api_key": "...", "numres": 5, "hide": 0, "minsim": 30, "output_type": 2}
             - anime_trace: {"model": "anime", "is_multi": 1, "ai_detect": 1, "base64": "..."}
             - ehentai: {"covers": false, "similar": true, "exp": false}
@@ -1693,7 +1621,7 @@ async def render_multi_engine_search(
         raise ValueError("未启用任何引擎，请在配置中开启至少一个引擎")
     file_arg = _build_file_arg(image, _ctx)
     proxy = _get_proxy()
-    pyquery_engines = {"ascii2d", "yandex", "google", "iqdb", "baidu", "google_lens", "ehentai", "exhentai"}
+    pyquery_engines = {"ascii2d", "yandex", "google", "iqdb", "baidu", "ehentai", "exhentai"}
     enabled_pyquery_engines = [e for e in engs if e in pyquery_engines]
     pyquery_init_error = ""
     if enabled_pyquery_engines:

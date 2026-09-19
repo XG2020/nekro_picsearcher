@@ -5,7 +5,6 @@ from .bing import Bing
 from .copyseeker import Copyseeker
 from .ehentai import EHentai
 from .google import Google
-from .google_lens import GoogleLens
 from .iqdb import Iqdb
 from .lenso import Lenso
 from .saucenao import SauceNAO
@@ -21,7 +20,6 @@ __all__ = [
     "Copyseeker",
     "EHentai",
     "Google",
-    "GoogleLens",
     "Iqdb",
     "Lenso",
     "SauceNAO",

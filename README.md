@@ -10,7 +10,7 @@
 - 通过配置项控制每个引擎启用或关闭
 - 效率控制：仅对前 N 条高可信结果抓取网页，或完全跳过网页抓取以提升响应速度
 - 网页抓取优化：更完整的浏览器模拟请求头、支持优先用代理、失败时自动切换代理策略重试
-- 支持 Ascii2D、AnimeTrace、TraceMoe、Yandex、Google、IQDB、Baidu、Bing、Google Lens、Lenso、Copyseeker、SauceNAO、Tineye、EHentai/ExHentai
+- 支持 Ascii2D、AnimeTrace、TraceMoe、Yandex、Google、IQDB、Baidu、Bing、Lenso、Copyseeker、SauceNAO、Tineye、EHentai/ExHentai
 
 ## 使用方式
 
@@ -62,7 +62,6 @@
 - enable_iqdb
 - enable_baidu
 - enable_bing
-- enable_google_lens
 - enable_lenso
 - enable_copyseeker
 - enable_saucenao
@@ -73,10 +72,6 @@
 - max_results
 - saucenao_api_key
 - yandex_cookies
-- google_serpapi_key
-- google_zenserp_key
-- google_search_country
-- google_search_language
 - allow_third_party_image_host
 - exhentai_cookie_member_id
 - exhentai_cookie_pass_hash
@@ -102,8 +97,6 @@
   - {"key": "...", "anilist_id": 123, "chinese_title": true, "cut_borders": true, "mute": false, "size": "m"}
 - iqdb
   - {"is_3d": false, "force_gray": false}
-- google_lens
-  - {"search_type": "all|products|visual_matches|exact_matches", "q": "...", "hl": "en", "country": "US"}
 - saucenao
   - {"api_key": "...", "numres": 5, "hide": 0, "minsim": 30, "output_type": 2}
 - anime_trace
@@ -119,9 +112,10 @@
 - Lenso 引擎在主仓标注为受 Cloudflare 影响，可能不可用
 - ExHentai 需要有效的登录 Cookie（ipb_member_id、ipb_pass_hash，可选 igneous）
 - AnimeTrace 的角色/作品识别结果即使没有网页 URL 也会保留在候选证据中
-- 参考实现的 Yandex/Google Lens 本地图搜会上传到临时图床，可通过 `allow_third_party_image_host` 关闭
+- 参考实现的 Yandex 本地图搜会上传到临时图床，可通过 `allow_third_party_image_host` 关闭
+- Yandex 搜图固定使用 `yandex.ru`；Google 搜图会先访问 `/ncr` 固定非地区跳转，再进入 `searchbyimage`
 - 默认只返回筛选后的可信结果，仅在无筛选结果时回退展示各引擎原始返回
 - 候选线索汇总属于文本片段聚合，可能混入站点名、转载页标题或商品页文案，最终结论应结合网页正文、页面证据和原图细节综合判断
 - 商品页面、聚合转载页面在出处识别中会被压低权重，优先返回原始发布平台与官方来源
 - 网页抓取支持自动代理策略切换：优先用代理→失败后（若启用）试不用代理，或反过来
-- AnimeTrace、SauceNAO、Yandex、Google Lens、E-Hentai 已切换到参考插件的统一请求/解析模块，支持共享代理、超时、Cookie 与 Google Lens 主备引擎
+- AnimeTrace、SauceNAO、Yandex、E-Hentai 已切换到参考插件的统一请求/解析模块，支持共享代理、超时与 Cookie

@@ -11,9 +11,10 @@ from .base import BaseSearchEngine
 class Yandex(BaseSearchEngine[YandexResponse]):
     def __init__(
         self,
-        base_url: str = "https://yandex.com",
+        base_url: str = "https://yandex.ru",
         **request_kwargs: Any,
     ):
+        base_url = base_url.replace("yandex.com", "yandex.ru")
         base_url = f"{base_url}/images/search"
         super().__init__(base_url, **request_kwargs)
 

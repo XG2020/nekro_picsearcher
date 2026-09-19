@@ -14,6 +14,8 @@ class Google(BaseSearchEngine[GoogleResponse]):
         base_url: str = "https://www.google.com",
         **request_kwargs: Any,
     ):
+        base_url = base_url.rstrip("/")
+        self.ncr_url = f"{base_url}/ncr"
         base_url = f"{base_url}/searchbyimage"
         super().__init__(base_url, **request_kwargs)
 
@@ -45,7 +47,11 @@ class Google(BaseSearchEngine[GoogleResponse]):
         file: str | bytes | Path | None = None,
         **kwargs: Any,
     ) -> GoogleResponse:
-        params: dict[str, Any] = {"sbisrc": 1, "safe": "off"}
+        # Visit Google's no-country-redirect endpoint on the same client first.
+        # This sets the regional cookie without changing the actual upload/search
+        # endpoint, which remains the supported /searchbyimage route.
+        await self._send_request(method="get", url=self.ncr_url)
+        params: dict[str, Any] = {"sbisrc": 1, "safe": "off", "ncr": 1}
 
         if url:
             params["image_url"] = url

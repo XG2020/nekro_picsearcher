@@ -15,29 +15,18 @@ class Yandex(BaseSearchReq[YandexResponse]):
 
     def __init__(
         self,
-        base_url: str = "https://yandex.com",
+        base_url: str = "https://yandex.ru",
         **request_kwargs: Any,
     ):
+        # Yandex's .com endpoint may redirect or present a different regional
+        # search page for mainland Chinese clients. Keep the request on .ru.
+        base_url = base_url.replace("yandex.com", "yandex.ru")
         base_url = f"{base_url}/images/search"
-        self.use_ru_fallback = request_kwargs.pop("use_ru_fallback", True)
+        request_kwargs.pop("use_ru_fallback", None)
         # max_results 在 search() 阶段使用，不会传给底层 httpx 客户端，这里先弹出避免报错
         request_kwargs.pop("max_results", None)
 
         super().__init__(base_url, **request_kwargs)
-
-    @override
-    async def _send_request(self, *args, **kwargs) -> Any:
-        try:
-            return await super()._send_request(*args, **kwargs)
-        except Exception as e:
-            # .com 被 Yandex 风控时回退到 .ru 域名重试
-            if self.use_ru_fallback and "yandex.com" in self.base_url:
-                self.base_url = self.base_url.replace("yandex.com", "yandex.ru")
-                try:
-                    return await super()._send_request(*args, **kwargs)
-                except Exception:
-                    pass
-            raise e
 
     @override
     async def search(
@@ -55,7 +44,7 @@ class Yandex(BaseSearchReq[YandexResponse]):
         if not target_url:
             raise ValueError("Must provide url or file")
 
-        # Yandex 通过 URL 搜索：https://yandex.com/images/search?rpt=imageview&url={target_url}
+        # Yandex 通过 .ru URL 搜索：https://yandex.ru/images/search?rpt=imageview&url={target_url}
         params = {"rpt": "imageview", "url": target_url}
 
         # 用浏览器 UA 头，降低被风控的概率
