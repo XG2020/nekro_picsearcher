@@ -88,6 +88,33 @@
 - webpage_prefer_proxy：网页抓取优先使用代理（配置了 DEFAULT_PROXY 时）
 - webpage_try_fallback：失败时自动切换代理策略重试（优先用代理→失败试不用代理，或反过来）
 
+## Cookie 获取方法
+
+### Yandex Cookie
+
+Yandex 反爬较严格，建议从插件实际使用的 `yandex.ru` 域名获取 Cookie：
+
+1. 在浏览器打开 `https://yandex.ru/images/`，完成登录或人机验证。
+2. 按 `F12` 打开开发者工具，切换到 **Network（网络）** 面板并刷新页面。
+3. 点击一个发往 `yandex.ru` 的请求，在 **Headers → Request Headers** 中找到 `Cookie`。
+4. 复制 `Cookie` 后面的完整内容，例如：
+
+   ```text
+   yandexuid=...; Session_id=...; is_gdpr=0; ...
+   ```
+
+5. 将整行内容粘贴到插件配置的 `yandex_cookies`。不要只复制某一个字段；通过 Network 面板获取可以包含 `HttpOnly` Cookie。
+
+### ExHentai Cookie
+
+如果启用了 `enable_exhentai`，需要从已登录的 `https://exhentai.org` 页面获取以下字段：
+
+1. 登录 ExHentai 后按 `F12`，进入 **Application（应用）→ Storage → Cookies → https://exhentai.org**。
+2. 分别找到 `ipb_member_id`、`ipb_pass_hash`，以及可选的 `igneous`。
+3. 将三个字段分别填写到插件配置中的 `exhentai_cookie_member_id`、`exhentai_cookie_pass_hash`、`exhentai_cookie_igneous`。
+
+Cookie 等同于登录凭证。不要把 Cookie 发给他人、提交到 Git 或写入日志；失效后重新获取即可。
+
 ## options 参数示例
 
 > options 仅对启用的引擎生效。
