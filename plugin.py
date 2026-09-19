@@ -392,6 +392,21 @@ def _safe_output_text(value: Any, max_len: int = 0) -> str:
     return text
 
 
+def _markdown_text(value: Any, max_len: int = 0) -> str:
+    """将外部搜索文本转为安全的 Markdown 行内文本。"""
+    text = _safe_output_text(value, max_len)
+    if not text:
+        return ""
+    return re.sub(r"([\\`*_\[\]<>#|])", r"\\\1", text)
+
+
+def _markdown_link(url: Any, label: str = "打开来源") -> str:
+    clean_url = str(url or "").strip()
+    if not _is_url(clean_url):
+        return _markdown_text(clean_url)
+    return f"[{_markdown_text(label)}](<{clean_url}>)"
+
+
 def _domain_of(url: str) -> str:
     try:
         return urlparse(url).netloc.lower().removeprefix("www.")
@@ -1529,6 +1544,80 @@ async def _do_search_single_safe(
     except Exception as ex:
         return {"ok": False, "engine": engine, "error": str(ex)}
 
+
+def _append_markdown_result(
+    lines: List[str],
+    index: int,
+    item: Dict[str, Any],
+    entry: Optional[Dict[str, Any]],
+    cfg: PicSearcherConfig,
+) -> None:
+    """以稳定的 Markdown 小节输出单条原始命中及其网页证据。"""
+    item_url = str(item.get("url") or item.get("video") or item.get("image") or "").strip()
+    title = _safe_output_text(
+        item.get("title")
+        or item.get("source")
+        or item.get("site_name")
+        or item.get("author")
+        or "未命名结果",
+        200,
+    )
+    lines.append(f"#### {index}. {_markdown_text(title)}")
+    if item_url:
+        lines.append(f"- 来源链接：{_markdown_link(item_url)}")
+    sim = item.get("similarity")
+    if sim is not None:
+        lines.append(f"- 相似度：`{_markdown_text(sim)}`")
+    size = _safe_output_text(item.get("size") or "", 80)
+    if size:
+        lines.append(f"- 尺寸：`{_markdown_text(size)}`")
+    src = _safe_output_text(
+        item.get("author") or item.get("site_name") or item.get("source") or "",
+        160,
+    )
+    if src:
+        lines.append(f"- 来源字段：{_markdown_text(src)}")
+    if not entry:
+        lines.append("- 页面证据：未整理（未纳入网页整理范围）")
+        return
+
+    risk_flags = _build_result_risk_flags(entry)
+    if risk_flags:
+        lines.append(f"- 风险提示：{_markdown_text('；'.join(risk_flags), 240)}")
+    page_evidence = "；".join((entry.get("page_evidence") or [])[:8])
+    if page_evidence:
+        lines.append(f"- 页面证据：{_markdown_text(page_evidence, 360)}")
+    page_summary = _safe_output_text(entry.get("page_evidence_summary", "无页面证据"), 360)
+    if page_summary:
+        lines.append(f"- 页面证据摘要：{_markdown_text(page_summary)}")
+    entities = entry.get("entities") or {}
+    entity_labels = (
+        ("人物/角色", "characters"),
+        ("作品/出处", "works"),
+        ("作者/画师", "authors"),
+        ("内容主题", "objects"),
+    )
+    for label, key in entity_labels:
+        values = entities.get(key) or []
+        if values:
+            lines.append(f"- {label}：{_markdown_text('；'.join(values[:4]), 260)}")
+    reasons = _safe_output_text("；".join(entry.get("reasons") or []), 360)
+    if reasons:
+        lines.append(f"- 结果元数据：{_markdown_text(reasons)}")
+    if entry.get("page_summary"):
+        summary = _markdown_text(entry["page_summary"], cfg.webpage_content_chars)
+        lines.append(f"- 网页正文摘要：\n  > {summary}")
+    page_error = entry.get("page_error")
+    if page_error and page_error != "empty":
+        if page_error == "no source url":
+            message = "该识别结果不含来源网页 URL，已保留文本证据"
+        else:
+            message = _safe_output_text(page_error, 240)
+        lines.append(f"- 网页处理提示：{_markdown_text(message)}")
+    elif page_error:
+        lines.append(f"- 网页处理提示：{_markdown_text(page_error, 240)}")
+
+
 @plugin.mount_sandbox_method(
     method_type=SandboxMethodType.AGENT,
     name="render_multi_engine_search",
@@ -1644,11 +1733,14 @@ async def render_multi_engine_search(
         mode_info.append("快速模式：已跳过所有来源网页抓取，仅返回搜图结果与基础证据，响应最快")
     else:
         mode_info.append(f"常规模式：仅对前 {use_fetch_top} 条候选结果抓取来源网页，后面结果保留搜图信息以提升速度")
+    image_display = _markdown_link(image, "查看输入图片") if _is_url(image) else f"`{_markdown_text(image)}`"
     lines: list[str] = [
-        f"Image: {image}",
-        f"引擎策略：{selection_info}",
-        "效率说明：" + "；".join(mode_info),
-        "阅读提示：上方候选线索汇总是为了帮助快速定位方向，详细网页证据与原始命中结果在后文。",
+        "# 反向搜图结果",
+        "",
+        f"- 输入图片：{image_display}",
+        f"- 引擎策略：{_markdown_text(selection_info)}",
+        f"- 效率模式：{_markdown_text('；'.join(mode_info))}",
+        "- 阅读说明：先看候选线索汇总，再按引擎查看原始命中和网页证据。",
     ]
     search_tasks = [
         _do_search_single_safe(e, cfg, k, file_arg, proxy, options)
@@ -1669,119 +1761,61 @@ async def render_multi_engine_search(
         enriched_lookup = _build_enriched_lookup(trusted)
         candidate_snapshot = _build_candidate_snapshot(trusted)
         usage_notes = _build_data_usage_notes(trusted)
-        lines.append("\n[候选线索汇总]")
+        lines.append("\n## 候选线索汇总")
         for structured_line in candidate_snapshot:
-            lines.append(structured_line)
-        lines.append("\n[数据使用提示]")
+            label, separator, value = structured_line.partition("：")
+            if separator:
+                lines.append(f"- **{_markdown_text(label)}**：{_markdown_text(value)}")
+            else:
+                lines.append(f"- {_markdown_text(structured_line)}")
+        lines.append("\n## 数据使用提示")
         for note in usage_notes:
-            lines.append(note)
-        lines.append("\n[候选结果数据]")
-        lines.append("说明：本区按引擎分组展示原始命中结果，不做跨引擎全局合并；全局层面仅额外提示重复 URL。")
-        lines.append(f"搜索概况：已启用 {len(engs)} 个引擎，成功返回 {len(search_results)} 个引擎结果，整理出 {len(trusted)} 条可读证据。")
-        lines.append("跨结果提示：" + "；".join(consensus_hints))
+            lines.append(f"- {_markdown_text(note)}")
+        lines.append("\n## 搜索概况")
+        lines.append(f"- 启用引擎：`{len(engs)}`")
+        lines.append(f"- 成功返回：`{len(search_results)}` 个引擎")
+        lines.append(f"- 可读证据：`{len(trusted)}` 条")
+        lines.append(f"- 跨结果提示：{_markdown_text('；'.join(consensus_hints))}")
         if duplicate_url_hints:
-            lines.append("重复 URL 提示：" + "；".join(duplicate_url_hints))
+            lines.append(f"- 重复 URL 提示：{_markdown_text('；'.join(duplicate_url_hints), 720)}")
         if engine_errors:
-            lines.append("引擎异常：" + "；".join(engine_errors))
+            lines.append(f"- 引擎异常：{_markdown_text('；'.join(engine_errors), 720)}")
+        lines.append("\n## 引擎原始结果")
         for result in search_results:
             engine = _safe_output_text(result.get("engine", ""), 60)
-            search_url = _safe_output_text(result.get("url", ""), 240)
-            lines.append(f"\n[{engine}]")
+            search_url = str(result.get("url", "")).strip()
+            lines.append(f"\n### {_markdown_text(engine or '未知引擎')}")
             if search_url:
-                lines.append(f"引擎入口：{search_url}")
+                lines.append(f"引擎入口：{_markdown_link(search_url, '打开搜索页')}")
             items = result.get("items", [])
             if not items:
-                lines.append("无原始命中结果")
+                lines.append("- 无原始命中结果")
                 continue
             for idx, item in enumerate(items, 1):
                 item_url = str(item.get("url") or item.get("video") or item.get("image") or "").strip()
-                title = _safe_output_text(item.get("title") or item.get("source") or item.get("site_name") or item.get("author") or "", 200)
-                parts: List[str] = []
-                if title:
-                    parts.append(title)
-                sim = item.get("similarity")
-                if sim is not None:
-                    parts.append(f"相似度 {sim}")
-                size = _safe_output_text(item.get("size") or "", 80)
-                if size:
-                    parts.append(f"尺寸 {size}")
-                src = _safe_output_text(item.get("author") or item.get("site_name") or item.get("source") or "", 120)
-                if src:
-                    parts.append(f"来源字段 {src}")
-                line = f"{idx}. " + " | ".join(parts) if parts else f"{idx}."
-                if item_url:
-                    line += f" -> {item_url}"
-                lines.append(line)
                 entry = enriched_lookup.get(item_url) if _is_url(item_url) else enriched_lookup.get(f"{engine}:{idx}")
-                if not entry:
-                    lines.append("页面证据：未整理 | 说明：未纳入网页整理范围")
-                    continue
-                risk_flags = _build_result_risk_flags(entry)
-                lines.append(
-                    f"页面证据：{_safe_output_text('；'.join((entry.get('page_evidence') or [])[:8]), 320)} | 摘要："
-                    f"{_safe_output_text(entry.get('page_evidence_summary', '无页面证据'), 320)}"
-                )
-                if risk_flags:
-                    lines.append(f"风险提示：{_safe_output_text('；'.join(risk_flags), 240)}")
-                entities = entry.get("entities") or {}
-                if entities.get("characters"):
-                    lines.append(f"人物/角色文本：{_safe_output_text('；'.join(entities['characters'][:4]), 240)}")
-                if entities.get("works"):
-                    lines.append(f"作品/出处文本：{_safe_output_text('；'.join(entities['works'][:4]), 240)}")
-                if entities.get("authors"):
-                    lines.append(f"作者/画师文本：{_safe_output_text('；'.join(entities['authors'][:4]), 240)}")
-                if entities.get("objects"):
-                    lines.append(f"内容主题文本：{_safe_output_text('；'.join(entities['objects'][:4]), 240)}")
-                lines.append(f"结果元数据：{_safe_output_text('；'.join(entry['reasons']), 320)}")
-                if entry.get("page_summary"):
-                    lines.append(f"网页正文：{_safe_output_text(entry['page_summary'], cfg.webpage_content_chars)}")
-                if entry.get("page_error") and entry.get("page_error") != "empty":
-                    page_error = entry.get("page_error")
-                    if page_error == "no source url":
-                        lines.append("网页处理提示：该识别结果不含来源网页 URL，已保留文本证据")
-                    else:
-                        lines.append(f"网页处理提示：{_safe_output_text(page_error, 240)}")
-                elif entry.get("page_error"):
-                    lines.append(f"网页内容获取失败：{_safe_output_text(entry['page_error'], 240)}")
+                _append_markdown_result(lines, idx, item, entry, cfg)
     else:
-        lines.append("\n[候选结果数据]")
-        lines.append("未找到可访问 URL 的候选结果，以下按引擎回退展示原始返回，供 AI 继续自行判断。")
+        lines.append("\n## 候选结果数据")
+        lines.append("> 未找到可访问 URL 的候选结果，以下按引擎回退展示原始返回，供后续判断。")
         for result in search_results:
             engine = _safe_output_text(result.get("engine", ""), 60)
-            search_url = _safe_output_text(result.get("url", ""), 240)
-            lines.append(f"\n[{engine}]")
+            search_url = str(result.get("url", "")).strip()
+            lines.append(f"\n### {_markdown_text(engine or '未知引擎')}")
             if search_url:
-                lines.append(f"引擎入口：{search_url}")
+                lines.append(f"引擎入口：{_markdown_link(search_url, '打开搜索页')}")
             items = result.get("items", [])
             if not items:
-                lines.append("无原始命中结果")
+                lines.append("- 无原始命中结果")
                 continue
             for idx, item in enumerate(items, 1):
-                parts: List[str] = []
-                title = _safe_output_text(item.get("title") or item.get("source") or item.get("site_name") or "", 160)
-                if title:
-                    parts.append(title)
-                sim = item.get("similarity")
-                if sim is not None:
-                    parts.append(f"相似度 {sim}")
-                size = _safe_output_text(item.get("size") or "", 80)
-                if size:
-                    parts.append(f"尺寸 {size}")
-                src = _safe_output_text(item.get("author") or item.get("site_name") or item.get("source") or "", 120)
-                if src:
-                    parts.append(f"来源字段 {src}")
-                item_url = str(item.get("url") or item.get("video") or item.get("image") or "").strip()
-                line = f"{idx}. " + " | ".join(parts) if parts else f"{idx}."
-                if item_url:
-                    line += f" -> {item_url}"
-                lines.append(line)
+                _append_markdown_result(lines, idx, item, None, cfg)
         if engine_errors:
-            lines.append("\n[引擎异常]")
-            lines.extend(engine_errors)
-    lines.append("\n[下一步回答要求]")
-    lines.append("请基于以上证据直接完成对用户的回答，不要只复述候选列表。")
-    lines.append("先给出当前最可能的身份/出处/作者判断，再说明关键证据来自哪些引擎、页面或重复 URL。")
-    lines.append("如果证据冲突或不足，请明确保留不确定性，并说明还缺什么证据。")
+            lines.append("\n### 引擎异常")
+            lines.extend(f"- {_markdown_text(error)}" for error in engine_errors)
+    lines.append("\n## 分析上下文")
+    lines.append("以上内容是反向搜图得到的原始命中、候选线索和网页证据，不应自动视为最终结论。")
+    lines.append("请结合用户的具体问题自由分析，并区分搜索结果与网页证据。")
     return "\n".join(lines)
 
 

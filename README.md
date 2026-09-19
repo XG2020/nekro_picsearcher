@@ -10,6 +10,7 @@
 - 通过配置项控制每个引擎启用或关闭
 - 效率控制：仅对前 N 条高可信结果抓取网页，或完全跳过网页抓取以提升响应速度
 - 网页抓取优化：更完整的浏览器模拟请求头、支持优先用代理、失败时自动切换代理策略重试
+- 结果整理：统一返回 Markdown，按候选摘要、引擎、来源链接和网页证据分层展示
 - 支持 Ascii2D、AnimeTrace、TraceMoe、Yandex、Google、IQDB、Baidu、Bing、Lenso、Copyseeker、SauceNAO、Tineye、EHentai/ExHentai
 
 ## 使用方式
